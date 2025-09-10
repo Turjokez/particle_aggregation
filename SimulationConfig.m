@@ -41,7 +41,10 @@ classdef SimulationConfig < handle
     
     methods
         function obj = SimulationConfig(varargin)
-            % Constructor - can accept parameter-value pairs
+            % SimulationConfig: Constructor - allows for initialization with parameter-value pairs.
+            % This method enables the user to create an instance of the
+            % SimulationConfig class and, optionally, override the default
+            % property values by passing in a list of parameter-value pairs.
             if nargin > 0
                 for i = 1:2:length(varargin)
                     if isprop(obj, varargin{i})
@@ -52,13 +55,17 @@ classdef SimulationConfig < handle
         end
         
         function grid = derive(obj)
-            %DERIVE Compute derived grid and constants
-            % Returns: DerivedGrid object with precomputed values
+            % derive: Computes and returns a DerivedGrid object with precomputed values.
+            % This method acts as a factory, creating a new object that
+            % contains values derived from the simulation configuration.
             grid = DerivedGrid(obj);
         end
         
         function validate(obj)
-            %VALIDATE Validate configuration parameters
+            % validate: Validates configuration parameters to ensure they are valid for the simulation.
+            % This method checks for common errors in the configuration,
+            % such as non-positive values for parameters that must be
+            % positive, and asserts that the specified values are logical.
             assert(obj.n_sections > 0, 'n_sections must be positive');
             assert(obj.t_final > obj.t_init, 't_final must be greater than t_init');
             assert(obj.delta_t > 0, 'delta_t must be positive');

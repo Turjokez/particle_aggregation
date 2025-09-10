@@ -1,8 +1,10 @@
 # Aggregation of Particulate Material in the Ocean
 
-## Overview
+## Adrian Burd
 
-This document describes a framework for understanding material and elemental distributions and fluxes in the oceans, focusing on the aggregation of particulate material.
+Professor, Department of Marine Sciences
+Franklin College of Arts and Sciences
+UNIVERSITY OF GEORGIA, 2025
 
 ## Class Structure
 
@@ -168,13 +170,6 @@ particle_aggregation/
 ├── README_OOP.md               # This documentation
 ```
 
-## Dependencies
-
-The OOP framework requires MATLAB with the following toolboxes:
-
-* **Base MATLAB**: Core functionality
-* **Optimization Toolbox**: For potential future steady-state calculations
-* **Statistics and Machine Learning Toolbox**: For potential future analysis features
 
 ## Testing
 
