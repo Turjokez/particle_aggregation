@@ -3,8 +3,7 @@
 ## Adrian Burd
 
 Professor, Department of Marine Sciences
-Franklin College of Arts and Sciences
-UNIVERSITY OF GEORGIA, 2025
+UGA, 2025
 
 ## Class Structure
 
@@ -180,5 +179,3 @@ example_usage
 ```
 
 ---
-
-This update reflects the files in your project and matches the original structure. Let me know if you'd like further changes!
