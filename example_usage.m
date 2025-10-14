@@ -8,6 +8,20 @@ clear all; close all;
 fprintf('Creating simulation with default parameters...\n');
 sim = CoagulationSimulation();
 
+%% UPDATED for Δx = 2 m - display vertical grid information
+fprintf('Vertical grid mode: %s\n', sim.verticalMode);
+if isfield(sim.verticalGrid, 'delta_z')
+    fprintf(' - Surface spacing Δz = %.1f m\n', sim.verticalGrid.delta_z(1));
+    fprintf(' - Number of layers: %d (max depth = %.0f m)\n', ...
+        numel(sim.verticalGrid.delta_z), sim.verticalGrid.edges(end));
+end
+
+%% UPDATED for Δx = 2 m - optional stretched grid example (commented)
+% sim.setVerticalMode('stretched', ...
+%     'StretchedBreaks', [0 250 600 1000], ...
+%     'StretchedSpacing', [25 50 100]);
+% fprintf('Switched to stretched grid (%d layers).\n', numel(sim.verticalGrid.delta_z));
+
 %% Run simulation
 fprintf('Running simulation...\n');
 result = sim.run();
@@ -15,6 +29,13 @@ result = sim.run();
 %% Generate outputs and plots
 fprintf('Generating outputs...\n');
 sim.generateOutputs(true);
+
+%% UPDATED for Δx = 2 m - report animation output
+if isfield(sim.result, 'vertical_profiles') && ...
+        isfield(sim.result.vertical_profiles, 'animation_file') && ...
+        ~isempty(sim.result.vertical_profiles.animation_file)
+    fprintf('Saved F(z) animation to: %s\n', sim.result.vertical_profiles.animation_file);
+end
 
 
 
