@@ -106,65 +106,9 @@ classdef CoagulationSimulation < handle
             obj.rhs.validate();
 
             % Solve ODEs
-            fprintf('Solving ODEs with disaggregation...\n');
+            fprintf('Solving ODEs...\n');
+            [t, Y] = obj.solver.solve(obj.rhs, tspan, v0, p.Results.solver_options);
 
-            Y_current = v0(:);
-            t = tspan(:);
-            nsteps = length(t);
-            Y = zeros(nsteps, length(Y_current));
-            Y(1,:) = Y_current';
-            
-            for i = 2:nsteps
-                % --- Coagulation step ---
-                [~, Ytemp] = obj.solver.solve(obj.rhs, [t(i-1) t(i)], Y_current, p.Results.solver_options);
-                Y_new = Ytemp(end,:)';  % last value from this step
-            
-                % =====================================================
-                %  UPDATE: Time-varying epsilon(t) support
-                % =====================================================
-                eps_here = obj.config.epsilon; % default (constant)
-                if isprop(obj.config,'epsilon_profile') && strcmpi(obj.config.epsilon_profile,'sine')
-                    if isprop(obj.config,'epsilon_mean') && isprop(obj.config,'epsilon_amp') && ...
-                       isprop(obj.config,'epsilon_period') && isprop(obj.config,'epsilon_phase')
-                        eps_here = obj.config.epsilon_mean + obj.config.epsilon_amp * ...
-                                   sin(2*pi*t(i)/obj.config.epsilon_period + obj.config.epsilon_phase);
-                        eps_here = max(eps_here, 0); % prevent negative values
-                    end
-                end
-
-                % === NEW ADDITION (Dynamic ε(t) scaling) ===
-                % Rescale shear-driven coagulation dynamically
-                if isfield(obj.operators,'betas')
-                    try
-                        beta_dynamic = obj.operators.betas; % copy base kernels
-                        if isfield(beta_dynamic,'shear')
-                            shear_scale = sqrt(eps_here / obj.config.epsilon_mean);
-                            beta_dynamic.shear = beta_dynamic.shear * shear_scale;
-                        end
-                        if ismethod(obj.rhs,'updateKernel')
-                            obj.rhs.updateKernel(beta_dynamic);
-                        end
-                    catch ME
-                        warning('Dynamic kernel update skipped: %s', ME.message);
-                    end
-                end
-                % =====================================================
-            
-                % --- Apply Disaggregation ---
-                % === Nonlinear disaggregation feedback ===
-                n_exp = 0.8; % exponent (~0.4–0.5 typical)
-                Y_new = Disaggregation.apply(Y_new, obj.grid, eps_here * (eps_here / obj.config.epsilon_mean)^n_exp);
-            
-                % --- Store & advance ---
-                Y(i,:) = Y_new';
-                Y_current = Y_new;
-            
-                if mod(i,10)==0
-                    fprintf('Step %d/%d → Disaggregation applied (ε=%.1e)\n', i, nsteps, eps_here);
-                end
-            end
-            fprintf('Mass conserved check → Initial: %.3e | Final: %.3e\n', sum(Y(1,:)), sum(Y(end,:)));
-            
             % Store results
             obj.result.time = t;
             obj.result.concentrations = Y;

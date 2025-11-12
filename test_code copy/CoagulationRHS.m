@@ -20,13 +20,6 @@ classdef CoagulationRHS < handle
             obj.config = config;      % Set configuration object
         end
 
-        % dynamic kernel update support
-        function updateKernel(obj, newBetas)
-            % UPDATEKERNEL Replace the coagulation kernels used by the RHS
-            % newBetas: BetaMatrices-like struct updated each timestep
-            obj.betas = newBetas;
-        end
-
         function dvdt = evaluate(obj, t, v)
             % EVALUATE Evaluate ODE right-hand side
             % t = time (unused but required by ODE solver)
@@ -65,53 +58,32 @@ classdef CoagulationRHS < handle
                     c3 * c4^isec * (v_pos(isec) - c4 * v_pos(isec+1));
             end
 
-            % Add NPP source term (Primary Production) ========
+            % ============================================================
+            % === Step 3: Add NPP source term (Primary Production) ========
+            % ============================================================
             if isprop(obj.config, 'use_NPP') && obj.config.use_NPP
                 n = numel(v);
                 s = zeros(n,1);
-            
-                % --- NEW block: read amplitude parameter if available ---
-                ampNPP = 0.5; % default 50% amplitude
-                if isprop(obj.config,'NPP_amp') && ~isempty(obj.config.NPP_amp)
-                    ampNPP = obj.config.NPP_amp;
-                end
-                % -------------------------------------------------------
 
-                % Time-varying productivity forcing 
-                % Optionally modulate NPP as a function of time (sinusoidal seasonal driver)
-                if isprop(obj.config,'use_NPP') && obj.config.use_NPP && ...
-                        strcmpi(obj.config.NPP_profile,'sine')
-                    % Sinusoidal variation around mean rate
-                    rate = obj.config.NPP_rate * (1 + ampNPP*sin(2*pi*t/obj.config.t_final)); % updated
-                else
-                    rate = obj.config.NPP_rate; % fallback default
-                end
-                
-                % Determine rate based on NPP profile type
+                % --- Determine rate based on NPP profile type ---
                 switch obj.config.NPP_profile
                     case 'constant'
                         rate = obj.config.NPP_rate;
-                
-                    case 'sine'
-                        % Smooth daily-scale NPP oscillation over full experiment
-                        T = obj.config.t_final;      % total days in experiment (e.g., 30)
-                        amp = ampNPP;                % updated amplitude
-                        rate = obj.config.NPP_rate * (1 + amp * sin(2*pi*t/T));
-                
+
                     case 'step'
                         if t < obj.config.NPP_t_step
                             rate = obj.config.NPP_rate;
                         else
                             rate = obj.config.NPP_rate_after;
                         end
-                
+
                     case 'pulse'
                         if abs(t - obj.config.NPP_t_step) < 0.5
                             rate = obj.config.NPP_rate;
                         else
                             rate = 0;
                         end
-                
+
                     otherwise
                         rate = 0;
                 end

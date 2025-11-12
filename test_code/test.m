@@ -1,0 +1,262 @@
+%% === SLAB MODEL: VARIABLE ε & NPP FORCING EXPERIMENTS ===
+% Tests how turbulence (ε) and productivity (NPP) control aggregation and export flux.
+% Implements time-varying ε(t), cumulative τ50 diagnostics, and sensitivity runs (ε, NPP, MLD).
+% --------------------------------------------------------------
+clear; clc; close all;
+
+outdir = fullfile(pwd, 'results');
+if ~exist(outdir, 'dir'), mkdir(outdir); end
+save_figs = true;
+colors = lines(8);
+lw = 1.4; fs = 11;
+
+%% BASE CONFIGURATION 
+base_cfg = SimulationConfig();
+base_cfg.t_final      = 30;          % duration [days]
+
+% NPP: sinusoidal, 30 d, ±50%
+base_cfg.use_NPP      = true;
+base_cfg.NPP_rate     = 5e-4;
+base_cfg.NPP_profile  = 'sine';      % sinusoidal forcing
+
+% ε(t): sinusoidal around 1e-6 ±9e-7, 10 d period
+base_cfg.epsilon_profile = 'sine';
+base_cfg.epsilon_mean    = 1e-6;
+base_cfg.epsilon_amp     = 9e-7;
+base_cfg.epsilon_period  = 10;
+base_cfg.epsilon_phase   = 0;
+base_cfg.epsilon         = base_cfg.epsilon_mean;  % compatibility
+
+base_cfg.temp = 20;
+base_cfg.salt = 35;
+
+%% FIG 1: Baseline In-phase Forcing — NPP, ε, Flux 
+fprintf('\n--- Running baseline simulation (in-phase forcing only) ---\n');
+
+cfg = base_cfg;
+cfg.epsilon_phase = 0;  % in-phase (0°)
+sim = CoagulationSimulation(cfg);
+out = sim.run();
+[t_flux, flux] = OutputGenerator.simpleFluxTimeSeries(out, DerivedGrid(cfg));
+
+% Plot results
+figure('Name','Core_Baseline_variableEpsilon_inPhase','Color','w');
+tiledlayout(3,1,'Padding','compact','TileSpacing','compact');
+
+% --- NPP forcing ---
+nexttile;
+tt = linspace(0, base_cfg.t_final, 100);
+NPP_t = base_cfg.NPP_rate * (1 + 0.5*sin(2*pi*tt/base_cfg.t_final));
+plot(tt, NPP_t, 'k', 'LineWidth', 1.5);
+xlabel('Time (d)'); ylabel('NPP (model d^{-1})');
+title('NPP vs Time','FontWeight','bold'); grid on;
+
+% --- ε forcing (in-phase only) ---
+nexttile;
+eps_t = base_cfg.epsilon_mean + base_cfg.epsilon_amp * ...
+        sin(2*pi*tt/base_cfg.epsilon_period + cfg.epsilon_phase);
+plot(tt, eps_t, 'b', 'LineWidth', 1.5);
+xlabel('Time (d)'); ylabel('\epsilon (W kg^{-1})');
+title('\epsilon vs Time (In-phase)','FontWeight','bold');
+legend({'In-phase (0°)'},'Location','best');
+grid on; ylim([min(eps_t)*0.8, max(eps_t)*1.2]);
+
+% --- Normalized flux ---
+nexttile;
+flux_norm = flux / max(flux);
+plot(t_flux, flux_norm, 'b', 'LineWidth', 1.5);
+xlabel('Time (d)'); ylabel('Normalized Flux (a.u.)');
+title('Flux vs Time (Normalized Response)','FontWeight','bold');
+legend({'In-phase (0°)'},'Location','best');
+grid on; ylim([0 1.2]);
+
+if save_figs
+    exportgraphics(gcf, fullfile(outdir,'01.png'),'Resolution',300);
+end
+
+fprintf('\n In-phase baseline figure saved.\n');
+fprintf(' Out-of-phase comparison available but skipped for clarity (similar flux response under current parameters).\n');
+
+%% FIG 2: ε SWEEP — Flux vs Time + τ50 (cumulative export)
+fprintf('\n[1] Running ε sweep...\n');
+eps_list    = [1e-8 1e-7 1e-6 1e-5];
+tau50_eps   = NaN(size(eps_list));
+flux_curves = cell(numel(eps_list),1);
+t_curves    = cell(numel(eps_list),1);
+Y_final     = cell(numel(eps_list),1);
+grid_all    = cell(numel(eps_list),1);
+
+for k = 1:numel(eps_list)
+    cfgk = base_cfg;
+    cfgk.epsilon_profile = 'constant';
+    cfgk.epsilon         = eps_list(k);
+    simk = CoagulationSimulation(cfgk);
+    outk = simk.run();
+    gridk = DerivedGrid(cfgk);
+    [tk, fk] = OutputGenerator.simpleFluxTimeSeries(outk, gridk);
+    t_curves{k}    = tk;
+    flux_curves{k} = fk;
+    tau50_eps(k)   = compute_tau50_cumulative(tk, fk);   % ← physical τ50
+    Y_final{k}     = outk.concentrations(end,:)';
+    grid_all{k}    = gridk;
+end
+
+figure('Name','eps_sweep_variableEpsilon','Color','w');
+tiledlayout(2,1,'Padding','compact','TileSpacing','compact');
+
+% --- (Top) Flux vs Time for ε sweep ---
+nexttile; hold on;
+for k = 1:numel(eps_list)
+    plot(t_curves{k}, flux_curves{k}, 'LineWidth', lw, 'Color', colors(k,:));
+end
+xlabel('Time (d)'); ylabel('Flux (a.u.)');
+title('Flux vs Time — \epsilon sweep','FontWeight','bold');
+legend(arrayfun(@(e)sprintf('\\epsilon=%.0e',e),eps_list,'UniformOutput',false),'Location','best');
+grid on;
+
+% --- (Bottom) τ50 vs ε ---
+nexttile;
+mask = isfinite(tau50_eps);
+if any(mask)
+    semilogx(eps_list(mask), tau50_eps(mask),'o-k','LineWidth',lw,'MarkerFaceColor','w');
+    grid on;
+    xlabel('\epsilon (W kg^{-1})');
+    ylabel('\tau_{50} (d)');
+    title('\tau_{50} vs \epsilon (cumulative export)','FontWeight','bold');
+    set(gca,'FontSize',fs);
+else
+    text(1e-7,0.5,'No valid \tau_{50}','FontSize',fs);
+end
+
+if save_figs
+    exportgraphics(gcf, fullfile(outdir,'02.png'),'Resolution',300);
+end
+
+%% FIG 3: Final PSDs for ε cases
+figure('Name','epsilon_sweep_PSD_variableEpsilon','Color','w'); hold on;
+nE = numel(eps_list); slopes = nan(1,nE);
+for k = 1:nE
+    if isempty(Y_final{k}), continue; end
+    gridk = grid_all{k};
+    diam  = 2 * gridk.getFractalRadii() * 1e4;  % cm → µm
+    y     = Y_final{k};
+    valid = y > 0 & isfinite(y);
+    if nnz(valid) < 3, continue; end
+    D = diam(valid); N = y(valid);
+    p = polyfit(log10(D), log10(N), 1);
+    slopes(k) = -p(1);
+    fit_line = 10.^(polyval(p, log10(D)));
+    loglog(D,N,'LineWidth',1.5,'Color',colors(k,:));
+    loglog(D,fit_line,'--','LineWidth',1.1,'Color',colors(k,:)*0.6);
+end
+xlabel('Particle diameter (\mum)','FontSize',fs);
+ylabel('Concentration (a.u.)','FontSize',fs);
+title('Final Particle Size Distribution vs Turbulence (\epsilon)','FontWeight','bold');
+legend(arrayfun(@(e,b)sprintf('\\epsilon = %.0e  (B = %.2f)',e,b),eps_list,slopes,'UniformOutput',false),...
+       'Location','southwest','FontSize',fs);
+set(gca,'XScale','log','YScale','log','XLim',[1e0 1e4],'YLim',[1e-10 1e-4],'LineWidth',1,'FontSize',fs);
+grid on; box on;
+if save_figs
+    exportgraphics(gcf, fullfile(outdir,'03.png'),'Resolution',300);
+end
+fprintf('\n✅ PSD figure with fitted slopes saved.\n');
+
+%% FIG 4–5: Biological & Physical Sensitivity (Combined Vertical Layout) 
+% FIG 4: NPP sensitivity  |  FIG 5: MLD proxy — in one 2×1 vertical figure
+
+% --- FIG 4: NPP Sensitivity -------------------------------------------------
+npp_levels = [1e-4 5e-4 1e-3];
+tN = cell(numel(npp_levels),1);
+fN = cell(numel(npp_levels),1);
+
+for k = 1:numel(npp_levels)
+    cfgk = base_cfg;
+    cfgk.NPP_profile     = 'constant';
+    cfgk.NPP_rate        = npp_levels(k);
+    cfgk.epsilon_profile = 'constant';
+    cfgk.epsilon         = base_cfg.epsilon_mean;
+    outk = CoagulationSimulation(cfgk).run();
+    [tN{k}, fN{k}] = OutputGenerator.simpleFluxTimeSeries(outk, DerivedGrid(cfgk));
+end
+
+% --- FIG 5: MLD Proxy ------------------------------------------------------
+mld_list = [10 20 30 40 50];
+ref_mld  = 30;
+tM = cell(numel(mld_list),1);
+fM = cell(numel(mld_list),1);
+
+for k = 1:numel(mld_list)
+    cfgk = base_cfg;
+    scale = ref_mld / mld_list(k);
+    cfgk.NPP_profile     = 'constant';
+    cfgk.NPP_rate        = base_cfg.NPP_rate * scale;
+    cfgk.epsilon_profile = 'constant';
+    cfgk.epsilon         = base_cfg.epsilon_mean;
+    outk = CoagulationSimulation(cfgk).run();
+    [tM{k}, fM{k}] = OutputGenerator.simpleFluxTimeSeries(outk, DerivedGrid(cfgk));
+end
+
+% --- Combined Plot (2×1 Vertical Layout) -----------------------------------
+figure('Name','NPP_MLD_sensitivity_combined','Color','w');
+tiledlayout(2,1,'Padding','compact','TileSpacing','compact');
+
+% (Top) NPP Sensitivity
+nexttile;
+for k = 1:numel(npp_levels)
+    plot(tN{k}, fN{k}, 'LineWidth', lw, 'Color', colors(k,:)); hold on;
+end
+xlabel('Time (d)'); ylabel('Flux (a.u.)');
+title('Flux vs Time — NPP Sensitivity (constant \epsilon)','FontWeight','bold');
+legend(arrayfun(@(x)sprintf('NPP=%.1e',x),npp_levels,'UniformOutput',false),'Location','best');
+grid on;
+
+% (Bottom) MLD Proxy
+nexttile;
+for k = 1:numel(mld_list)
+    plot(tM{k}, fM{k}, 'LineWidth', lw, 'Color', colors(k,:)); hold on;
+end
+xlabel('Time (d)'); ylabel('Flux (a.u.)');
+title('Flux vs Time — Mixed-layer Proxy (10–50 m)','FontWeight','bold');
+legend(arrayfun(@(z)sprintf('MLD %2.0f m',z),mld_list,'UniformOutput',false),'Location','best');
+grid on;
+
+% --- Save combined figure --------------------------------------------------
+if save_figs
+    exportgraphics(gcf, fullfile(outdir,'04.png'),'Resolution',300);
+end
+
+
+%% Supporting Functions 
+
+% τ50 (for rise time only) 
+function t50 = compute_tau50_rise(t, f)
+    t50 = NaN;
+    if isempty(t) || isempty(f) || all(~isfinite(f)) || max(f) <= 0, return; end
+    [fmax, imax] = max(f);
+    if imax < 2, return; end
+    target = 0.5*fmax;
+    i = find(f(1:imax) >= target, 1, 'first');
+    if isempty(i) || i == 1, return; end
+    t50 = t(i-1) + (target - f(i-1)) * (t(i) - t(i-1)) / (f(i) - f(i-1));
+end
+
+% physically meaningful τ50 (cumulative export fraction)
+function t50 = compute_tau50_cumulative(t, f)
+    % Returns the time when cumulative flux reaches 50% of total export
+    t50 = NaN;
+    if isempty(t) || isempty(f) || all(~isfinite(f)) || max(f) <= 0
+        return;
+    end
+    t = t(:); f = f(:);
+    f(~isfinite(f) | f < 0) = 0;
+    Fcum = cumtrapz(t, f);
+    Ftot = Fcum(end);
+    if Ftot <= 0, return; end
+    target = 0.5 * Ftot;
+    i = find(Fcum >= target, 1, 'first');
+    if isempty(i) || i == 1
+        t50 = t(1);
+    else
+        t50 = t(i-1) + (target - Fcum(i-1)) * (t(i) - t(i-1)) / (Fcum(i) - Fcum(i-1));
+    end
+end

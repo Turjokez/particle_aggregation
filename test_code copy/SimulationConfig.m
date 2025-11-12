@@ -28,14 +28,7 @@ classdef SimulationConfig < handle
 
         % --- New experiment parameters (Step 1 additions) ---
         epsilon = 1e-7;          % turbulent kinetic-energy dissipation [W kg⁻¹]
-
-        % --- Optional time-varying turbulence forcing ---
-        epsilon_profile char = 'constant';  % 'constant' or 'sine'
-        epsilon_mean double = 1e-6;         % mean dissipation rate [W kg^-1]
-        epsilon_amp double  = 0;            % amplitude for 'sine' profile
-        epsilon_period double = 30;         % period (days) for 'sine' forcing
-        epsilon_phase double = 0;           % phase offset [radians] for 'sine' forcing
-
+       
         salt = 35;               % salinity [psu]
     
         use_NPP = false;         % switch on/off primary production source
@@ -47,25 +40,6 @@ classdef SimulationConfig < handle
         % Disaggregation parameters
         c3 = 0.2;              % For curvilinear kernel
         c4 = 1.45;             % For curvilinear kernel
-
-        % === New forcing & disaggregation control knobs ===
-        % Amplitude of sinusoidal NPP forcing (fraction of mean, default = 0.5)
-        NPP_amp double = 0.5
-
-        % Reference epsilon for nonlinear breakup scaling
-        epsilon_ref double = 1e-6
-
-        % Enable nonlinear epsilon-dependent disaggregation
-        disagg_use_nonlinear (1,1) logical = false
-
-        % Controls how maximum aggregate size depends on epsilon
-        % k_max(eps) ≈ disagg_kmax_a * n_sections * (eps/epsilon_ref)^(-disagg_beta)
-        disagg_kmax_a double = 0.60     % fraction of bins active at epsilon_ref
-        disagg_beta  double = 0.35      % exponent sensitivity to turbulence
-
-        % Redistribution rules for particles above the cap
-        disagg_frac_to_edge double = 1/3  % ~1/3 of tail mass to the edge bin
-        disagg_redistribute_p double = 0  % 0 = uniform; >0 biases toward small bins
         
         % Parameters for solving equations
         t_init = 0.0;          % Initial time for integrations [d]

@@ -1,0 +1,85 @@
+classdef Disaggregation
+    %DISAGGREGATION Turbulence-driven breakup operator
+    %   Ynew = Disaggregation.apply(Y, grid, epsilon)
+
+    methods (Static)
+        function Ynew = apply(Yin, grid, epsilon)
+            % Yin: column or row vector of concentrations
+
+            % --- Ensure column and get sizes ---
+            Y0 = Yin(:);
+            r  = grid.getFractalRadii();   % cm
+            r  = r(:);
+
+            mass0 = sum(Y0);
+            if mass0 <= 0
+                Ynew = Y0;
+                return;
+            end
+
+            % =========================================================
+            % --- Breakup scaling: tunable but mild -------------------
+            % =========================================================
+            B = 0.45;          % ε exponent (0.3–0.5 reasonable)old .35
+            C = 2e-3;          % sets baseline cutoff size old (3e-3)
+            r_max = C * epsilon^(-B);
+
+            % =========================================================
+            % --- Smooth suppression of unstable large bins ----------
+            % =========================================================
+            ratio = r ./ max(r_max, 1e-12);
+            % no effect for ratio<=1; exponential decay beyond
+            frag_factor = exp(-3.5 * max(ratio - 1, 0)); %old2.5
+            Y_frag = Y0 .* frag_factor;
+
+            % lost mass to redistribute
+            lost_mass = mass0 - sum(Y_frag);
+            if lost_mass < 0
+                lost_mass = 0;
+            end
+
+            Y = Y_frag;
+
+            % =========================================================
+            % --- Redistribute lost mass toward small particles -------
+            % =========================================================
+            if lost_mass > 0
+                w = r.^(-2.5);              % bias to small sizes (old 2.5)
+                w = w / sum(w);
+                Y = Y + lost_mass * w;
+            end
+
+            % =========================================================
+            % --- Enforce exact mass conservation ---------------------
+            % =========================================================
+            mass_new = sum(Y);
+            if mass_new > 0
+                Y = Y * (mass0 / mass_new);
+            end
+
+            Ynew = Y;
+        end
+
+        % ===============================================================
+        % === NEW nonlinear disaggregation scaling utility ============
+        % ===============================================================
+        function Ynew = applyWithScaling(Yin, grid, eps_here, eps_ref, n_exp)
+            % applyWithScaling: turbulence-dependent breakup intensity
+            %   Yin     - concentration vector
+            %   grid    - DerivedGrid object
+            %   eps_here - current epsilon [W kg^-1]
+            %   eps_ref  - reference mean epsilon [W kg^-1]
+            %   n_exp    - exponent controlling nonlinearity (~0.4–0.6)
+
+            if nargin < 5, n_exp = 0.45; end
+            if nargin < 4 || isempty(eps_ref), eps_ref = eps_here; end
+
+            % nonlinear feedback scaling (Aldridge-style)
+            scale = (eps_here / eps_ref)^n_exp;
+            scale = max(scale, 1e-3);   % prevent zero or negative scaling
+
+            % call the existing function with scaled epsilon
+            Ynew = Disaggregation.apply(Yin, grid, eps_here * scale);
+        end
+    end
+end
