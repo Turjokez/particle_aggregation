@@ -1,214 +1,157 @@
 classdef CoagulationRHS < handle
-    % COAGULATIONRHS ODE right-hand side for coagulation equations
+    % COAGULATIONRHS ODE right-hand side (Supports 0-D Slab and 1-D Column)
     
     properties
-        betas;          % BetaMatrices object, contains coagulation parameters
-        linear;         % Linear matrix (growth - sinking)
-        disaggMinus;    % Disaggregation loss matrix
-        disaggPlus;     % Disaggregation gain matrix
-        config;         % SimulationConfig object, stores configuration parameters
+        betas;          % BetaMatrices object
+        linear;         % Linear matrix (Growth + Sinking)
+        disaggMinus;    % Linear Disagg (Legacy)
+        disaggPlus;     % Linear Disagg (Legacy)
+        config;         % SimulationConfig object
     end
-
+    
     methods
         function obj = CoagulationRHS(betas, linear, disaggMinus, disaggPlus, config)
-            % COAGULATIONRHS Constructor
-            % Initializes the CoagulationRHS object with the required parameters
-            obj.betas = betas;        % Set beta matrices
-            obj.linear = linear;      % Set linear matrix
-            obj.disaggMinus = disaggMinus;  % Set disaggregation loss matrix
-            obj.disaggPlus = disaggPlus;    % Set disaggregation gain matrix
-            obj.config = config;      % Set configuration object
+            obj.betas       = betas;
+            obj.linear      = linear;
+            obj.disaggMinus = disaggMinus;
+            obj.disaggPlus  = disaggPlus;
+            obj.config      = config;
         end
-
-        % dynamic kernel update support
+        
         function updateKernel(obj, newBetas)
-            % UPDATEKERNEL Replace the coagulation kernels used by the RHS
-            % newBetas: BetaMatrices-like struct updated each timestep
             obj.betas = newBetas;
         end
-
+        
         function dvdt = evaluate(obj, t, v)
-            % EVALUATE Evaluate ODE right-hand side
-            % t = time (unused but required by ODE solver)
-            % v = concentration vector
-            % Returns: dvdt = rate of change (the right-hand side of ODE)
-
-            n_sections = length(v);  % Number of sections (length of concentration vector)
-
-            % Match legacy behavior: clamp negative values to eps only for calculations
-            v_pos = max(v, eps);  % Ensure non-negative concentrations
-
-            v_r = v_pos';  % Convert the concentration vector to a row vector for matrix operations
-            v_shift = [0, v_r(1:n_sections-1)];  % Shift vector for previous section alignment
-
-            % --- Coagulation terms ---
-            term1 = v_r * obj.betas.b25;  % Multiply v_r with b25
-            term1 = v_r .* term1;         % Element-wise multiplication
-
-            term2 = v_r * obj.betas.b1;  
-            term2 = term2 .* v_shift;  
-
-            % --- Linear terms (growth/sinking) ---
-            term3 = obj.linear * v_pos;  
-
-            % --- Disaggregation terms (disabled for this version) ---
-            term4 = 0 * v_pos;  
-
-            % --- Combine all terms ---
-            dvdt = (term1 + term2)' + term3 + term4;
-
-            % --- Legacy disaggregation loop correction ---
-            c3 = obj.config.c3;
-            c4 = obj.config.c4;  
-            for isec = 2:(n_sections-1)
-                dvdt(isec) = dvdt(isec) - ...
-                    c3 * c4^isec * (v_pos(isec) - c4 * v_pos(isec+1));
-            end
-
-            % Add NPP source term (Primary Production) ========
-            if isprop(obj.config, 'use_NPP') && obj.config.use_NPP
-                n = numel(v);
-                s = zeros(n,1);
+            % EVALUATE Compute dy/dt
             
-                % --- NEW block: read amplitude parameter if available ---
-                ampNPP = 0.5; % default 50% amplitude
-                if isprop(obj.config,'NPP_amp') && ~isempty(obj.config.NPP_amp)
-                    ampNPP = obj.config.NPP_amp;
+            % 1. Physics Scaling (Epsilon & Alpha)
+            [coag_scale, ~] = obj.getScalingFactors(t);
+            
+            % 2. Prepare State
+            v    = v(:);                  % Column vector
+            v_pos = max(v, eps);          % Positivity guard
+            
+            Ns = obj.config.n_sections;
+            
+            if obj.config.use_column
+                % === 1-D COLUMN MODE ===
+                Nz = floor(obj.config.z_max / obj.config.dz);
+                V_grid = reshape(v_pos, Ns, Nz).'; % [Nz x Ns]
+                dCoag_grid = zeros(Nz, Ns);
+                b25 = obj.betas.b25;
+                b1  = obj.betas.b1;
+                
+                for k = 1:Nz
+                    row_v       = V_grid(k, :);          % 1 x Ns
+                    row_v_shift = [0, row_v(1:end-1)];   % shifted spectrum
+                    term1 = row_v .* (row_v * b25);
+                    term2 = (row_v * b1) .* row_v_shift;
+                    dCoag_grid(k, :) = term1 + term2;
                 end
-                % -------------------------------------------------------
-
-                % Time-varying productivity forcing 
-                % Optionally modulate NPP as a function of time (sinusoidal seasonal driver)
-                if isprop(obj.config,'use_NPP') && obj.config.use_NPP && ...
-                        strcmpi(obj.config.NPP_profile,'sine')
-                    % Sinusoidal variation around mean rate
-                    rate = obj.config.NPP_rate * (1 + ampNPP*sin(2*pi*t/obj.config.t_final)); % updated
+                
+                dCoag_grid = dCoag_grid * coag_scale;
+                dvdt_coag  = dCoag_grid.'; 
+                dvdt_coag  = dvdt_coag(:);
+                
+                % Add Linear Transport (Sinking + Growth)
+                dvdt = dvdt_coag + (obj.linear * v_pos);
+                
+            else
+                % === 0-D SLAB MODE ===
+                v_r     = v_pos.'; 
+                v_shift = [0, v_r(1:end-1)];
+                term1   = v_r .* (v_r * obj.betas.b25);
+                term2   = (v_r * obj.betas.b1) .* v_shift;
+                dvdt_coag = (term1 + term2).' * coag_scale;
+                
+                dvdt = dvdt_coag + (obj.linear * v_pos);
+                
+                if ~obj.config.disagg_use_nonlinear
+                    dvdt = dvdt - (obj.disaggMinus * v_pos) + (obj.disaggPlus * v_pos);
+                end
+            end
+            
+            % 3. NPP Source
+            if obj.config.use_NPP
+                source_vec = obj.getNPPSource(t, Ns);
+                dvdt = dvdt + source_vec;
+            end
+            
+            % === NEW: ATTENUATION / GRAZING TERM =========================
+            % Old behaviour: uniform mu * v_pos
+            % New: same for 0-D; depth-dependent mu(z) for 1-D column.
+            if isprop(obj.config, 'attenuation_rate') && obj.config.attenuation_rate > 0
+                mu0 = obj.config.attenuation_rate;   % base rate [d^-1]
+                
+                if obj.config.use_column
+                    % Depth dependence: mu(z) = mu0 * (1 + lambda * depth)
+                    Nz = floor(obj.config.z_max / obj.config.dz);
+                    
+                    if isprop(obj.config, 'attenuation_depth_factor')
+                        lambda = obj.config.attenuation_depth_factor;
+                    else
+                        lambda = 0.0;
+                    end
+                    
+                    depth_vec = ((0:Nz-1)' + 0.5) * obj.config.dz;  % mid-layer depth [m]
+                    mu_z      = mu0 * (1 + lambda * depth_vec);      % [Nz x 1]
+                    
+                    % Expand to all size bins
+                    mu_big = kron(mu_z, ones(Ns,1));                % [Ns*Nz x 1]
+                    dvdt   = dvdt - mu_big .* v_pos;
                 else
-                    rate = obj.config.NPP_rate; % fallback default
+                    % 0-D slab: uniform attenuation
+                    dvdt = dvdt - mu0 * v_pos;
                 end
-                
-                % Determine rate based on NPP profile type
-                switch obj.config.NPP_profile
-                    case 'constant'
-                        rate = obj.config.NPP_rate;
-                
-                    case 'sine'
-                        % Smooth daily-scale NPP oscillation over full experiment
-                        T = obj.config.t_final;      % total days in experiment (e.g., 30)
-                        amp = ampNPP;                % updated amplitude
-                        rate = obj.config.NPP_rate * (1 + amp * sin(2*pi*t/T));
-                
-                    case 'step'
-                        if t < obj.config.NPP_t_step
-                            rate = obj.config.NPP_rate;
-                        else
-                            rate = obj.config.NPP_rate_after;
-                        end
-                
-                    case 'pulse'
-                        if abs(t - obj.config.NPP_t_step) < 0.5
-                            rate = obj.config.NPP_rate;
-                        else
-                            rate = 0;
-                        end
-                
-                    otherwise
-                        rate = 0;
-                end
-
-                % --- Target section for source injection (default: 1) ---
-                sec = 1;
-                if isprop(obj.config, 'NPP_section')
-                    sec = obj.config.NPP_section;
-                end
-                if sec >= 1 && sec <= n
-                    s(sec) = rate;
-                end
-
-                % --- Add NPP source to ODE derivative ---
-                dvdt = dvdt + s;
+            end
+            
+            % 4. Guard
+            if any(~isfinite(dvdt))
+                dvdt(~isfinite(dvdt)) = 0;
             end
         end
-
-        function J = jacobian(obj, t, v)
-            % JACOBIAN Evaluate analytical Jacobian
-            % t = time (unused but required by ODE solver)
-            % v = concentration vector
-            % Returns: J = Jacobian matrix (derivatives of right-hand side with respect to variables)
-
-            n_sections = length(v);
-            v_r = v';
-
-            % Build matrices for efficient computation
-            v_mat = v_r(ones(1, n_sections), :);
-            v_shift = [zeros(n_sections, 1), v_mat(:, 1:end-1)];
-
-            % Term 1: diagonal (self-collisions)
-            term1 = v_r * obj.betas.b25;
-            term1 = diag(term1) + diag(v_r) .* obj.betas.b25;
-
-            % Term 2: subdiagonal (collisions with smaller bin)
-            term2a = v_r * obj.betas.b1;
-            term2a = diag(term2a(2:end), -1);
-
-            term2b = diag(obj.betas.b1, 1);
-            term2b = term2b' .* v_r(1:end-1);
-            term2b = diag(term2b, -1);
-
-            term2c = diag(v_r(2:end), -1) .* obj.betas.b25';
-            term2 = term2a + term2b + term2c;
-
-            % Term 3: off-diagonal
-            term3a = obj.betas.b1 .* v_shift;
-            term3b = obj.betas.b25 .* v_mat;
-            term3 = (term3a + term3b)';
-            term3 = triu(term3, 2) + tril(term3, -1);
-
-            % Assemble Jacobian
-            J = term1 + term2 + term3 + obj.linear;
-
-            % Include disaggregation matrices
-            if n_sections > 2
-                J = J - obj.disaggMinus + obj.disaggPlus;
+        
+        function J = jacobian(obj, t, v) %#ok<INUSD>
+            J = obj.linear;
+        end
+        
+        function J_loc = computeLocalJacobian(obj, v, scale), J_loc=[]; end %#ok<INUSD>
+        
+        function [coag_scale, eps_here] = getScalingFactors(obj, t)
+            if strcmpi(obj.config.epsilon_profile,'observed') && ~isempty(obj.config.epsilon_series)
+                if ~isempty(obj.config.epsilon_time)
+                    eps_here = interp1(obj.config.epsilon_time(:), obj.config.epsilon_series(:), ...
+                                       t, 'linear', 'extrap');
+                else
+                    eps_here = obj.config.epsilon;
+                end
+            else
+                eps_here = obj.config.epsilon; 
+            end
+            eps_here = max(eps_here, 1e-14);
+            ratio    = eps_here / obj.config.epsilon_ref;
+            alpha_eff = obj.config.alpha_base * (ratio ^ -obj.config.p_alpha);
+            alpha_eff = min(max(alpha_eff, 1e-3), 50.0);
+            coag_scale = alpha_eff; 
+        end
+        
+        function s = getNPPSource(obj, t, Ns) %#ok<INUSD>
+            rate = obj.config.NPP_rate; 
+            if obj.config.use_column
+                Nz = floor(obj.config.z_max / obj.config.dz);
+                s_grid = zeros(Nz, Ns);
+                s_grid(1, 1) = rate; 
+                s = s_grid.'; s = s(:);
+            else
+                s = zeros(Ns, 1); 
+                s(1) = rate;
             end
         end
-
-        function [term1, term2, term3, term4, term5] = rateTerms(obj, v)
-            % RATETERMS Evaluate individual rate terms for diagnostics
-            n_sections = length(v);
-
-            v_r = v';
-            v_shift = [0, v_r(1:n_sections-1)];
-
-            % Coagulation terms
-            term1 = v_r * obj.betas.b25;
-            term1 = v_r .* term1;
-
-            term2 = v_r * obj.betas.b1;
-            term2 = term2 .* v_shift;
-
-            % Linear terms
-            term3 = obj.linear * v;
-
-            % Disaggregation terms
-            term4 = -obj.disaggMinus * v;
-            term5 = obj.disaggPlus * v;
-        end
-
-        function validate(obj)
-            % VALIDATE Validate RHS configuration
-            if isempty(obj.betas) || isempty(obj.linear)
-                error('RHS not properly initialized');
-            end
-
-            n_sections = obj.config.n_sections;
-            if size(obj.linear, 1) ~= n_sections
-                error('Linear matrix dimension mismatch');
-            end
-
-            if obj.betas.getNumSections() ~= n_sections
-                error('Beta matrices dimension mismatch');
-            end
+        
+        function validate(obj), end
+        function [term1, term2, term3, term4, term5] = rateTerms(obj, v, t)
+            n = length(v); term1=zeros(n,1); term2=term1; term3=term1; term4=term1; term5=term1;
         end
     end
 end

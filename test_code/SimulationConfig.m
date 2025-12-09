@@ -1,87 +1,102 @@
 classdef SimulationConfig < handle
-    %SIMULATIONCONFIG Configuration class for coagulation simulation parameters
+    % SIMULATIONCONFIG (Updated with Attenuation + generic loss)
     
     properties
+        % ===========================
         % Physical parameters
-        rho_fl = 1.0275;        % Fluid density [g cm^{-3}]
-        kvisc = 0.01;           % Kinematic viscosity [cm^2 s^{-1}]
-        g = 980;                % Accel. due to gravity [cm s^{-2}]
-        day_to_sec = 8.64e04;   % Seconds in a day [s d^{-1}]
-        k = 1.3e-16;           % Boltzmanns constant [erg K^{-1}]
-        r_to_rg = 1.36;        % Interaction radius to radius of gyration
-  
-        % Section/coagulation related parameters
-        n_sections = 20;        % Number of sections
-        kernel = 'KernelBrown'; % Kernel type
-        d0 = 20e-4;            % Diameter of unit particle [cm]
-        fr_dim = 2.33;         % Particle fractal dimension
-        n1 = 100;              % No. particles cm^{-3} in first section
+        % ===========================
+        rho_fl      = 1.0275;      % Fluid density [g cm^{-3}]
+        kvisc       = 0.01;        % Kinematic viscosity [cm^2 s^{-1}]
+        g           = 980;         % Gravity [cm s^{-2}]
+        day_to_sec  = 8.64e04;     % Seconds in a day
+        k           = 1.3e-16;     % Boltzmann constant
+        r_to_rg     = 1.36;        % Fractal scaling
+        temp        = 20 + 273;    % Temp [K]
+        salt        = 35;          % Salinity [psu]
         
-        % Other input parameters
-        temp = 20 + 273;       % Temperature [K]
-        alpha = 1.0;           % Stickiness
-        dz = 65;               % Layer thickness [m]
-        gamma = 0.1;           % Average shear rate [s^{-1}]
-        growth = 0.15;         % Specific growth rate in first section [d^{-1}]
-        gro_sec = 4;           % Section at which growth in aggregates starts
-        num_1 = 10^3;          % Number of particle cm^{-3} in first section
-
-        % --- New experiment parameters (Step 1 additions) ---
-        epsilon = 1e-7;          % turbulent kinetic-energy dissipation [W kg⁻¹]
-
-        % --- Optional time-varying turbulence forcing ---
-        epsilon_profile char = 'constant';  % 'constant' or 'sine'
-        epsilon_mean double = 1e-6;         % mean dissipation rate [W kg^-1]
-        epsilon_amp double  = 0;            % amplitude for 'sine' profile
-        epsilon_period double = 30;         % period (days) for 'sine' forcing
-        epsilon_phase double = 0;           % phase offset [radians] for 'sine' forcing
-
-        salt = 35;               % salinity [psu]
-    
-        use_NPP = false;         % switch on/off primary production source
-        NPP_rate = 0;            % base rate (model units day⁻¹)
-        NPP_profile = 'constant';% 'constant' | 'step' | 'pulse'
-        NPP_t_step = 10;         % day when step/pulse occurs
-        NPP_rate_after = 0;      % value after step
+        % ===========================
+        % Section parameters
+        % ===========================
+        n_sections  = 20;          % Number of size bins
+        kernel      = 'KernelBrown'; 
+        d0          = 20e-4;       % Min diameter [cm]
+        fr_dim      = 2.33;        
+        num_1       = 10^3;        % Init concentration
         
-        % Disaggregation parameters
-        c3 = 0.2;              % For curvilinear kernel
-        c4 = 1.45;             % For curvilinear kernel
-
-        % === New forcing & disaggregation control knobs ===
-        % Amplitude of sinusoidal NPP forcing (fraction of mean, default = 0.5)
-        NPP_amp double = 0.5
-
-        % Reference epsilon for nonlinear breakup scaling
-        epsilon_ref double = 1e-6
-
-        % Enable nonlinear epsilon-dependent disaggregation
-        disagg_use_nonlinear (1,1) logical = false
-
-        % Controls how maximum aggregate size depends on epsilon
-        % k_max(eps) ≈ disagg_kmax_a * n_sections * (eps/epsilon_ref)^(-disagg_beta)
-        disagg_kmax_a double = 0.60     % fraction of bins active at epsilon_ref
-        disagg_beta  double = 0.35      % exponent sensitivity to turbulence
-
-        % Redistribution rules for particles above the cap
-        disagg_frac_to_edge double = 1/3  % ~1/3 of tail mass to the edge bin
-        disagg_redistribute_p double = 0  % 0 = uniform; >0 biases toward small bins
+        % ===========================
+        % 1-D COLUMN GRID PARAMETERS
+        % ===========================
+        use_column (1,1) logical = true;   % Enable 1D mode
+        z_max      = 200;                  % Max depth [m]
+        dz         = 10;                   % Layer thickness [m]
         
-        % Parameters for solving equations
-        t_init = 0.0;          % Initial time for integrations [d]
-        t_final = 30.0;        % Final time for integrations [d]
-        delta_t = 1.0;         % Time interval for output [d]
+        % ===========================
+        % Biological & Physics parameters
+        % ===========================
+        alpha       = 1.0;         % Stickiness
+        gamma       = 0.1;         % Shear rate [s^{-1}]
+        growth      = 0.15;        % Specific growth rate [d^{-1}]
+        gro_sec     = 4;           % Growth start section
         
-        % Code Runtime Options
-        tracer = false;         % Integrate tracer as well [false=no, true=yes]
+        % === Attenuation / Grazing ===
+        attenuation_rate         = 0.10;   % mu, tuned [d^{-1}]
+        attenuation_depth_factor = 0.01;   % extra loss per 10 m layer (dimensionless)
+        
+        % NEW: generic linear loss (e.g. respiration / grazing)
+        loss_rate                = 0.05;   % [d^{-1}]
+        
+        % NPP (Source)
+        use_NPP         = true;      % now on by default
+        NPP_rate        = 5e-5;      % tuned NPP
+        NPP_profile     = 'constant';
+        NPP_section     = 1;
+        NPP_t_step      = 0;
+        NPP_rate_after  = 0;
+        NPP_amp         = 0.5;
+        
+        % ===========================
+        % Legacy Linear Breakup (Restored)
+        % ===========================
+        c3 = 0.1;   % Fragmentation rate const
+        c4 = 1.4;   % Fragment distribution slope
+        
+        % ===========================
+        % Turbulence & Disaggregation (New)
+        % ===========================
+        epsilon_profile char = 'observed'; 
+        epsilon          = 1e-7;
+        epsilon_time     = [];     
+        epsilon_series   = [];
+        epsilon_ref      = 1e-6; 
+        epsilon_mean     = 1e-6;
+        epsilon_amp      = 0;
+        epsilon_period   = 30;
+        epsilon_phase    = 0;
+        
+        % Scaling of alpha with epsilon
+        alpha_base       = 1.0;
+        p_alpha          = 0.0; 
+        alpha_clip_min   = 1e-3;
+        alpha_clip_max   = 50;
+
+        % Nonlinear Breakup Settings
+        disagg_use_nonlinear (1,1) logical = true;
+        disagg_kmax_a           = 0.95; 
+        disagg_beta             = 1.0;
+        disagg_frac_to_edge     = 0.40;
+        disagg_redistribute_p   = 1.5;
+        
+        % ===========================
+        % Time Integration
+        % ===========================
+        t_init  = 0.0;
+        t_final = 30.0;
+        delta_t = 0.5;
+        tracer  = false;
     end
     
     methods
         function obj = SimulationConfig(varargin)
-            % SimulationConfig: Constructor - allows for initialization with parameter-value pairs.
-            % This method enables the user to create an instance of the
-            % SimulationConfig class and, optionally, override the default
-            % property values by passing in a list of parameter-value pairs.
             if nargin > 0
                 for i = 1:2:length(varargin)
                     if isprop(obj, varargin{i})
@@ -92,21 +107,14 @@ classdef SimulationConfig < handle
         end
         
         function grid = derive(obj)
-            % derive: Computes and returns a DerivedGrid object with precomputed values.
-            % This method acts as a factory, creating a new object that
-            % contains values derived from the simulation configuration.
             grid = DerivedGrid(obj);
         end
         
         function validate(obj)
-            % validate: Validates configuration parameters to ensure they are valid for the simulation.
-            % This method checks for common errors in the configuration,
-            % such as non-positive values for parameters that must be
-            % positive, and asserts that the specified values are logical.
             assert(obj.n_sections > 0, 'n_sections must be positive');
-            assert(obj.t_final > obj.t_init, 't_final must be greater than t_init');
-            assert(obj.delta_t > 0, 'delta_t must be positive');
-            % Add more validation as needed
+            if mod(obj.z_max, obj.dz) > 1e-5
+                warning('z_max is not a multiple of dz. Grid may be uneven.');
+            end
         end
     end
 end

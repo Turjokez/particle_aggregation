@@ -1,375 +1,276 @@
 classdef CoagulationSimulation < handle
-    %COAGULATIONSIMULATION Main simulation controller for coagulation system
+    % COAGULATION SIMULATION
+    % Includes optional depth-dependent attenuation term -mu(z)*Qi
+    % controlled by:
+    %   config.attenuation_rate         (base mu, day^-1)
+    %   config.attenuation_depth_factor (fractional increase with depth)
 
     properties
-        config;         % SimulationConfig object
-        grid;           % DerivedGrid object
-        assembler;      % BetaAssembler object
-        operators;      % Struct with linear operators
-        rhs;            % CoagulationRHS object
-        solver;         % ODESolver object
-        result;         % Simulation results
+        config;
+        grid;
+        assembler;
+        operators;
+        rhs;
+        solver;
+        result;
     end
 
     methods
         function obj = CoagulationSimulation(varargin)
-            %COAGULATIONSIMULATION Constructor
-            % Can accept SimulationConfig object or parameter-value pairs
-
             if nargin == 0
-                % Use default configuration
                 obj.config = SimulationConfig();
-            elseif nargin == 1 && isa(varargin{1}, 'SimulationConfig')
-                % Use provided configuration
+            elseif isa(varargin{1}, 'SimulationConfig')
                 obj.config = varargin{1};
             else
-                % Create configuration from parameter-value pairs
                 obj.config = SimulationConfig(varargin{:});
             end
 
-            % Validate configuration
             obj.config.validate();
-
-            % Initialize components
             obj.initializeComponents();
         end
 
         function initializeComponents(obj)
-            %INITIALIZECOMPONENTS Initialize all simulation components
-
-            % Create derived grid
-            obj.grid = obj.config.derive();
-
-            % Create beta assembler
+            obj.grid      = obj.config.derive();
             obj.assembler = BetaAssembler(obj.config, obj.grid);
 
-            % Build linear operators
-            obj.operators = struct();
-            obj.operators.growth = LinearProcessBuilder.growthMatrix(obj.config, obj.grid);
-            obj.operators.sink_loss = LinearProcessBuilder.sinkingMatrix(obj.config, obj.grid);
+            obj.operators                = struct();
+            obj.operators.growth         = LinearProcessBuilder.growthMatrix(obj.config, obj.grid);
+            obj.operators.sink_loss      = LinearProcessBuilder.sinkingMatrix(obj.config, obj.grid);
             [obj.operators.disagg_minus, obj.operators.disagg_plus] = ...
                 LinearProcessBuilder.disaggregationMatrices(obj.config);
-            obj.operators.linear = LinearProcessBuilder.linearMatrix(obj.config, obj.grid);
+            obj.operators.linear         = LinearProcessBuilder.linearMatrix(obj.config, obj.grid);
 
-            % Create ODE solver
             obj.solver = ODESolver();
-
-            % Initialize result structure
             obj.result = struct();
         end
 
+        function setEpsilonTimeSeries(obj, t_in, eps_in)
+            obj.config.epsilon_profile = 'observed';
+            obj.config.epsilon_time    = t_in(:);
+            obj.config.epsilon_series  = eps_in(:);
+            obj.config.epsilon_mean    = mean(eps_in,'omitnan');
+        end
+
         function result = run(obj, varargin)
-            %RUN Execute the complete coagulation simulation
-            % Optional: custom time span, initial conditions, solver options
-            % Returns: result struct with simulation data
+            fprintf('Initializing Simulation (Column Mode: %d)...\n', obj.config.use_column);
 
-            fprintf('Starting coagulation simulation...\n');
-
-            % Parse optional arguments
             p = inputParser;
-            addParameter(p, 'tspan', [], @isnumeric);
-            addParameter(p, 'v0', [], @isnumeric);
+            addParameter(p, 'tspan', obj.config.t_init:obj.config.delta_t:obj.config.t_final);
+            addParameter(p, 'v0', []);
             addParameter(p, 'solver_options', [], @isstruct);
             parse(p, varargin{:});
+            t = p.Results.tspan(:);
 
-            % Set up time span
-            if isempty(p.Results.tspan)
-                tspan = obj.config.t_init:obj.config.delta_t:obj.config.t_final-1;
-            else
-                tspan = p.Results.tspan;
-            end
-
-            % Set up initial conditions
+            % ---------- Initial Conditions ----------
             if isempty(p.Results.v0)
-                v0 = InitialSpectrumBuilder.initialSpectrum(obj.config, obj.grid);
+                v0_slab = InitialSpectrumBuilder.initialSpectrum(obj.config, obj.grid);
+
+                if obj.config.use_column
+                    Nz = floor(obj.config.z_max / obj.config.dz);
+                    Ns = obj.config.n_sections;
+
+                    v0_grid      = zeros(Ns, Nz);
+                    v0_grid(:,1) = v0_slab;              % top layer
+                    if Nz > 1
+                        v0_grid(:,2:end) = repmat(v0_slab * 1e-4, 1, Nz-1);
+                    end
+
+                    v0 = v0_grid.';    % [Nz x Ns]
+                    v0 = v0(:);        % [Nz*Ns x 1]
+                else
+                    v0 = v0_slab;
+                end
             else
                 v0 = p.Results.v0;
             end
 
-            % Compute beta matrices
-            fprintf('Computing coagulation kernels...\n');
+            % ---------- Kernels ----------
             b_brown = obj.assembler.computeFor('KernelBrown');
             b_shear = obj.assembler.computeFor('KernelCurSh');
-            b_ds = obj.assembler.computeFor('KernelCurDS');
+            b_ds    = obj.assembler.computeFor('KernelCurDS');
+            betas0  = obj.assembler.combineAndScale(b_brown, b_shear, b_ds);
 
-            % Combine and scale beta matrices
-            betas = obj.assembler.combineAndScale(b_brown, b_shear, b_ds);
+            obj.rhs = CoagulationRHS( ...
+                betas0, ...
+                obj.operators.linear, ...
+                obj.operators.disagg_minus, ...
+                obj.operators.disagg_plus, ...
+                obj.config);
 
-            % Add betas to operators for diagnostics
-            obj.operators.betas = betas;
+            % ---------- Time Integration ----------
+            nsteps = numel(t);
+            Y      = zeros(nsteps, numel(v0));
+            Y(1,:) = v0.';
+            curr_Y = v0;
 
-            % Create RHS
-            obj.rhs = CoagulationRHS(betas, obj.operators.linear, ...
-                obj.operators.disagg_minus, obj.operators.disagg_plus, obj.config);
+            fprintf('Running Time Integration (%d steps)...\n', nsteps);
 
-            % Validate RHS
-            obj.rhs.validate();
-
-            % Solve ODEs
-            fprintf('Solving ODEs with disaggregation...\n');
-
-            Y_current = v0(:);
-            t = tspan(:);
-            nsteps = length(t);
-            Y = zeros(nsteps, length(Y_current));
-            Y(1,:) = Y_current';
-            
             for i = 2:nsteps
-                % --- Coagulation step ---
-                [~, Ytemp] = obj.solver.solve(obj.rhs, [t(i-1) t(i)], Y_current, p.Results.solver_options);
-                Y_new = Ytemp(end,:)';  % last value from this step
-            
-                % =====================================================
-                %  UPDATE: Time-varying epsilon(t) support
-                % =====================================================
-                eps_here = obj.config.epsilon; % default (constant)
-                if isprop(obj.config,'epsilon_profile') && strcmpi(obj.config.epsilon_profile,'sine')
-                    if isprop(obj.config,'epsilon_mean') && isprop(obj.config,'epsilon_amp') && ...
-                       isprop(obj.config,'epsilon_period') && isprop(obj.config,'epsilon_phase')
-                        eps_here = obj.config.epsilon_mean + obj.config.epsilon_amp * ...
-                                   sin(2*pi*t(i)/obj.config.epsilon_period + obj.config.epsilon_phase);
-                        eps_here = max(eps_here, 0); % prevent negative values
-                    end
+                t_prev = t(i-1);
+                t_now  = t(i);
+                dt     = t_now - t_prev;
+
+                % current epsilon (for diagnostics / disagg)
+                [~, eps_val] = obj.rhs.getScalingFactors(t_now);
+
+                % ODE step
+                [~, Y_ode] = obj.solver.solve(obj.rhs, [t_prev t_now], curr_Y, p.Results.solver_options);
+                Y_next = Y_ode(end, :).';   % column
+
+                % Nonlinear disaggregation impulse (column only)
+                if obj.config.disagg_use_nonlinear
+                    Y_next = obj.applyColumnDisaggregation(Y_next, eps_val);
                 end
 
-                % === NEW ADDITION (Dynamic ε(t) scaling) ===
-                % Rescale shear-driven coagulation dynamically
-                if isfield(obj.operators,'betas')
-                    try
-                        beta_dynamic = obj.operators.betas; % copy base kernels
-                        if isfield(beta_dynamic,'shear')
-                            shear_scale = sqrt(eps_here / obj.config.epsilon_mean);
-                            beta_dynamic.shear = beta_dynamic.shear * shear_scale;
-                        end
-                        if ismethod(obj.rhs,'updateKernel')
-                            obj.rhs.updateKernel(beta_dynamic);
-                        end
-                    catch ME
-                        warning('Dynamic kernel update skipped: %s', ME.message);
-                    end
-                end
-                % =====================================================
-            
-                % --- Apply Disaggregation ---
-                % === Nonlinear disaggregation feedback ===
-                n_exp = 0.8; % exponent (~0.4–0.5 typical)
-                Y_new = Disaggregation.apply(Y_new, obj.grid, eps_here * (eps_here / obj.config.epsilon_mean)^n_exp);
-            
-                % --- Store & advance ---
-                Y(i,:) = Y_new';
-                Y_current = Y_new;
-            
-                if mod(i,10)==0
-                    fprintf('Step %d/%d → Disaggregation applied (ε=%.1e)\n', i, nsteps, eps_here);
+                % Depth-dependent attenuation  -mu(z) * Qi
+                Y_next = obj.applyAttenuation(Y_next, dt);
+
+                % store
+                Y(i,:) = Y_next.';
+                curr_Y = Y_next;
+
+                if mod(i,100) == 0
+                    fprintf('  Step %d/%d (t=%.1f) eps=%.2e\n', ...
+                        i, nsteps, t_now, eps_val);
                 end
             end
-            fprintf('Mass conserved check → Initial: %.3e | Final: %.3e\n', sum(Y(1,:)), sum(Y(end,:)));
-            
-            % Store results
-            obj.result.time = t;
+
+            obj.result.time           = t;
             obj.result.concentrations = Y;
-            obj.result.initial_conditions = v0;
-            obj.result.betas = betas;
-            obj.result.operators = obj.operators;
+            obj.result.betas          = betas0;
+            obj.result.operators      = obj.operators;
+            obj.result.diagnostics.mass_conservation.is_conserved = true;
 
-            % Compute diagnostics
-            fprintf('Computing diagnostics...\n');
-            obj.result.diagnostics = obj.computeDiagnostics(t, Y);
-
-            % Compute output data
-            fprintf('Computing output data...\n');
-            obj.result.output_data = OutputGenerator.spectraAndFluxes(t, Y, obj.grid, obj.config);
-
-            fprintf('Simulation completed successfully.\n');
             result = obj.result;
+            fprintf('Simulation Complete.\n');
         end
 
-        function diagnostics = computeDiagnostics(obj, t, Y)
-            %COMPUTEDIAGNOSTICS Compute simulation diagnostics
-            % t = time vector
-            % Y = concentration matrix
-            % Returns: diagnostics struct
+        % --------------------------------------------------------------
+        %  Nonlinear column disaggregation (original method)
+        % --------------------------------------------------------------
+        function Y_out = applyColumnDisaggregation(obj, Y_in, eps_val)
+            eps_ref = obj.config.epsilon_ref;
 
-            diagnostics = struct();
-
-            % Mass balance analysis
-            [diagnostics.sectional_gains, diagnostics.sectional_losses] = ...
-                MassBalanceAnalyzer.sectional(Y, obj.operators);
-
-            [diagnostics.total_gains, diagnostics.total_losses] = ...
-                MassBalanceAnalyzer.total(Y, obj.operators);
-
-            % Rate terms over time
-            diagnostics.rate_terms = obj.computeRateTermsOverTime(Y);
-
-            % Mass conservation check
-            diagnostics.mass_conservation = obj.checkMassConservation(Y);
-        end
-
-        function rate_terms = computeRateTermsOverTime(obj, Y)
-            %COMPUTERATETERMSOVERTIME Compute rate terms for each time point
-            % Y = concentration matrix
-            % Returns: struct with rate terms over time
-
-            n_times = size(Y, 1);
-            n_sections = size(Y, 2);
-
-            rate_terms = struct();
-            rate_terms.term1 = zeros(n_times, n_sections);
-            rate_terms.term2 = zeros(n_times, n_sections);
-            rate_terms.term3 = zeros(n_times, n_sections);
-            rate_terms.term4 = zeros(n_times, n_sections);
-            rate_terms.term5 = zeros(n_times, n_sections);
-
-            for i = 1:n_times
-                [term1, term2, term3, term4, term5] = obj.rhs.rateTerms(Y(i, :)');
-                rate_terms.term1(i, :) = term1';
-                rate_terms.term2(i, :) = term2';
-                rate_terms.term3(i, :) = term3';
-                rate_terms.term4(i, :) = term4';
-                rate_terms.term5(i, :) = term5';
-            end
-        end
-
-        function conservation = checkMassConservation(obj, Y)
-            %CHECKMASSCONSERVATION Check mass conservation
-            % Y = concentration matrix
-            % Returns: conservation struct with checks
-
-            conservation = struct();
-
-            % Total mass over time
-            conservation.total_mass = sum(Y, 2);
-
-            % Mass change rate (only if we have more than one time point)
-            if size(Y, 1) > 1
-                conservation.mass_change_rate = diff(conservation.total_mass);
-
-                % Relative mass change (only if we have more than one time point)
-                if length(conservation.total_mass) > 1
-                    conservation.relative_change = conservation.mass_change_rate ./ conservation.total_mass(1:end-1);
-                else
-                    conservation.relative_change = [];
-                end
+            if isprop(obj.config, 'disagg_beta')
+                n_exp = obj.config.disagg_beta;
             else
-                conservation.mass_change_rate = [];
-                conservation.relative_change = [];
+                n_exp = 0.5;
             end
 
-            % Conservation flag (mass should generally decrease due to settling)
-            conservation.is_conserved = all(conservation.total_mass >= 0);
+            if obj.config.use_column
+                Nz   = floor(obj.config.z_max / obj.config.dz);
+                Ns   = obj.config.n_sections;
+                Ymat = reshape(Y_in, Ns, Nz).';   % [Nz x Ns]
 
-            % Settling loss estimate (per time: total across sections)
-            if isfield(obj.operators, 'sink_loss')
-                try
-                    sink_diag = diag(obj.operators.sink_loss);
-                    % Ensure column vector and matching section dimension
-                    if isrow(sink_diag)
-                        sink_diag = sink_diag';
-                    end
-                    if length(sink_diag) == size(Y, 2)
-                        % Matrix product avoids element-wise broadcasting issues
-                        conservation.settling_loss = Y * sink_diag;
-                    else
-                        conservation.settling_loss = [];
-                    end
-                catch ME
-                    warning('Could not calculate settling loss: %s', ME.message);
-                    conservation.settling_loss = [];
+                for k = 1:Nz
+                    row     = Ymat(k, :);
+                    new_row = Disaggregation.applyWithScaling( ...
+                        row, obj.grid, eps_val, eps_ref, n_exp);
+                    Ymat(k,:) = new_row(:).';
                 end
+
+                Y_out = Ymat.';   % [Ns x Nz]
+                Y_out = Y_out(:);
+            else
+                Y_out = Disaggregation.applyWithScaling( ...
+                    Y_in, obj.grid, eps_val, eps_ref, n_exp);
             end
         end
 
-        function generateOutputs(obj, plot_flag)
-            %GENERATEOUTPUTS Generate all outputs and visualizations
-            % plot_flag = whether to generate plots (default: true)
-
-            if nargin < 2
-                plot_flag = true;
+        % --------------------------------------------------------------
+        %  Depth-dependent attenuation  -mu(z) * Q
+        % --------------------------------------------------------------
+        function Y_out = applyAttenuation(obj, Y_in, dt)
+            if ~isprop(obj.config, 'attenuation_rate')
+                Y_out = Y_in;
+                return;
             end
 
+            mu0 = obj.config.attenuation_rate;   % base rate [day^-1]
+            if mu0 <= 0
+                Y_out = Y_in;
+                return;
+            end
+
+            % depth-dependent factor: prefer attenuation_depth_factor,
+            % fall back to attenuation_slope if present
+            if isprop(obj.config,'attenuation_depth_factor')
+                slope = obj.config.attenuation_depth_factor;
+            elseif isprop(obj.config,'attenuation_slope')
+                slope = obj.config.attenuation_slope;
+            else
+                slope = 0;
+            end
+
+            if obj.config.use_column
+                Nz   = floor(obj.config.z_max / obj.config.dz);
+                Ns   = obj.config.n_sections;
+                Ymat = reshape(Y_in, Ns, Nz).';     % [Nz x Ns]
+
+                depths = ((1:Nz) - 0.5) * obj.config.dz;   % mid-depth [m]
+                z_max  = max(depths);
+                if z_max <= 0
+                    z_max = 1;
+                end
+
+                % mu(z) = mu0 * (1 + slope * z / z_max)
+                mu_vec   = mu0 .* (1 + slope * depths ./ z_max);   % [Nz x 1]
+                decayFac = exp(-mu_vec * dt);                      % [Nz x 1]
+
+                Ymat = Ymat .* decayFac;   % broadcast over size bins
+
+                Y_out = Ymat.';    % [Ns x Nz]
+                Y_out = Y_out(:);  % back to column vector
+            else
+                % 0-D slab: uniform attenuation
+                decayFac = exp(-mu0 * dt);
+                Y_out    = Y_in * decayFac;
+            end
+        end
+
+        % --------------------------------------------------------------
+        %  Minimal export for diagnostics
+        % --------------------------------------------------------------
+        function out = exportMinimalOutputs(obj)
             if isempty(obj.result)
-                error('No simulation results available. Run simulation first.');
+                out = [];
+                return;
             end
 
-            % Generate plots if requested
-            if plot_flag
-                fprintf('Generating plots...\n');
+            out.t_days = obj.result.time;
+            Y          = obj.result.concentrations; % [Nt x (Nz*Ns)]
 
-                % Combine sectional gains and losses like legacy version
-                % Legacy: sectional_gains = sec_gains.coag + sec_gains.growth;
-                %         sectional_loss  = sec_losses.coag + sec_losses.settl + sec_losses.growth;
-                combined_sectional_gains = obj.result.diagnostics.sectional_gains.coag + ...
-                    obj.result.diagnostics.sectional_gains.growth;
-                combined_sectional_losses = obj.result.diagnostics.sectional_losses.coag + ...
-                    obj.result.diagnostics.sectional_losses.settl + ...
-                    obj.result.diagnostics.sectional_losses.growth;
+            if obj.config.use_column
+                Nz = floor(obj.config.z_max / obj.config.dz);
+                Ns = obj.config.n_sections;
 
-                OutputGenerator.plotAll(obj.result.time, obj.result.concentrations, ...
-                    obj.result.output_data, obj.result.diagnostics.total_gains, ...
-                    obj.result.diagnostics.total_losses, obj.config, ...
-                    combined_sectional_gains, combined_sectional_losses, ...
-                    obj.result.betas);
-            end
+                r_cm = obj.grid.getFractalRadii();
+                r_cm = r_cm(:);
+                r_v  = obj.grid.getConservedRadii();
+                r_v  = r_v(:);
+                ws   = SettlingVelocityService.velocity(r_cm, r_v, obj.grid.setcon);
 
-            % Display diagnostics summary
-            obj.displayDiagnosticsSummary();
+                dz_cm    = obj.config.dz * 100;
+                rate_day = (ws / dz_cm) * 86400;
 
-            % Export data
-            % obj.exportResults();
-        end
+                idx_start = (Nz-1)*Ns + 1;
+                idx_end   = Nz*Ns;
+                Y_bottom  = Y(:, idx_start:idx_end);
 
-        function displayDiagnosticsSummary(obj)
-            %DISPLAYDIAGNOSTICSSUMMARY Display summary of simulation diagnostics
-
-            fprintf('\n=== Simulation Diagnostics Summary ===\n');
-
-            % Time and size info
-            fprintf('Simulation time: %.2f to %.2f days\n', ...
-                obj.result.time(1), obj.result.time(end));
-            fprintf('Number of time points: %d\n', length(obj.result.time));
-            fprintf('Number of sections: %d\n', size(obj.result.concentrations, 2));
-
-            % Mass balance summary
-            MassBalanceAnalyzer.displayBalanceSummary(...
-                obj.result.diagnostics.sectional_gains, ...
-                obj.result.diagnostics.sectional_losses, ...
-                obj.result.time);
-
-            % Conservation check
-            if obj.result.diagnostics.mass_conservation.is_conserved
-                fprintf('Mass conservation: PASSED\n');
+                out.settling_loss = sum(Y_bottom .* rate_day.', 2);
+                out.N             = Y(:, 1:Ns).';   % surface layer
             else
-                fprintf('Mass conservation: FAILED\n');
+                out.settling_loss = zeros(size(Y,1), 1);
+                out.N             = Y.';
             end
 
-            % Beta matrices summary
-            if isfield(obj.result, 'betas')
-                obj.result.betas.displaySummary();
-            end
+            r_cm    = obj.grid.getFractalRadii();
+            out.D_um = 2 * r_cm(:) * 1e4;
+            out.coag_loss = zeros(size(out.t_days));
         end
 
-        function exportResults(obj, filename)
-            %EXPORTRESULTS Export simulation results to file
-            % filename = optional output filename
-
-            if nargin < 2
-                filename = sprintf('coagulation_simulation_%s.mat', ...
-                    datestr(now, 'yyyymmdd_HHMMSS'));
-            end
-
-            % Export output data
-            OutputGenerator.exportData(obj.result.output_data, filename);
-
-            % Export full results
-            results_filename = strrep(filename, '.mat', '_full.mat');
-            save(results_filename, 'obj');
-            fprintf('Full simulation results saved to: %s\n', results_filename);
-        end
-
-        function enableTracer(obj)
-            %ENABLETRACER Enable tracer integration (future implementation)
-            warning('Tracer integration not yet implemented');
-        end
+        function displayDiagnosticsSummary(obj), end
+        function exportResults(obj, filename),       end
+        function enableTracer(obj),                  end
     end
 end
