@@ -1,17 +1,12 @@
 function simulation_runner
 % SIMULATION_RUNNER 
 %
-%  Runs:
-%    B1) Atlantic column with observed epsilon
-%    B2) Square-wave turbulence test
-%    B3) EOF analysis (attenuation + seesaw) from Atlantic run
-%
 %      parameters i used 
 %    - attenuation_rate (mu)      = 0.12 day^-1
 %    - attenuation_depth_factor   = 0.5   (mu increases with depth)
 %    - NPP_rate                   = 3e-5  day^-1
 %    - NPP finite bloom: on until day 10, off afterwards
-%    - Stronger  isaggregation
+%    - Stronger  disaggregation
 
 clc;
 mu_tuned        = 0.12;
@@ -24,9 +19,7 @@ if ~exist(outDir,'dir')
     mkdir(outDir);
 end
 
-
 %  observed epsilon
-
 [simA, cfgA, eps_runA] = run_atlantic_column(mu_tuned, NPP_tuned, ...
     NPP_stop_day, depth_slope);
 
@@ -36,8 +29,6 @@ figA = make_flux_plots(simA.result, simA.grid, cfgA, eps_runA, ...
 saveas(figA, fullfile(outDir, 'flux.png'));
 
 %   Square-wave turbulence test
-
-
 [simB, cfgB, eps_runB] = run_square_wave(mu_tuned, NPP_tuned, ...
     NPP_stop_day, depth_slope);
 
@@ -47,7 +38,6 @@ figB = make_flux_plots(simB.result, simB.grid, cfgB, eps_runB, ...
 saveas(figB, fullfile(outDir, 'squareWave_flux.png'));
 
 %  EOF analysis using 
-
 tA   = simA.result.time;
 YA   = simA.result.concentrations;
 D_um = 2 * simA.grid.getFractalRadii() * 1e4;
@@ -55,13 +45,23 @@ D_um = 2 * simA.grid.getFractalRadii() * 1e4;
 [figC_maps, figC_3d] = analyze_model_eofs_save( ...
     'Atlantic', tA, YA, D_um, cfgA, eps_runA, outDir, 'B3_EOF');
 
+% ---- small fix: make sure returned values are figure handles ----
+if ~isgraphics(figC_maps,'figure')
+    warning('analyze_model_eofs_save: figC_maps not a figure, using current figure.');
+    figC_maps = gcf;
+end
+if ~isgraphics(figC_3d,'figure')
+    warning('analyze_model_eofs_save: figC_3d not a figure, using current figure.');
+    figC_3d = gcf;
+end
+% -----------------------------------------------------------------
+
 saveas(figC_maps, fullfile(outDir, 'EOF_maps_PCs.png'));
 saveas(figC_3d,   fullfile(outDir, 'EOF_3D_slices.png'));
 
 end
 
 %  column run
-
 function [sim, cfg, eps_run] = run_atlantic_column(mu_val, NPP_val, ...
     NPP_stop_day, depth_slope)
 
@@ -109,7 +109,6 @@ sim.run('tspan', t_run);
 end
 
 %  Square-wave turbulence run
-
 function [sim, cfg, eps_run] = run_square_wave(mu_val, NPP_val, ...
     NPP_stop_day, depth_slope)
 
@@ -238,9 +237,7 @@ legend('Location','northeast');
 grid on; box on;
 end
 
-
 %  EOF analysis + 3D slices 
-
 function [fig_maps, fig_3d] = analyze_model_eofs_save( ...
     title_prefix, t, Y, D_um, cfg, eps_run, outDir, tag)
 
@@ -387,7 +384,6 @@ plot_psd_slice_subplot(ax3, t, depths, D_mm, Y2_3d, ...
 end
 
 %  Helper: 3D plot
-
 function plot_psd_slice_subplot(ax_handle, t_days, depths, D_mm, PSD_3d, ...
     title_str, c_limits)
 
@@ -429,14 +425,12 @@ title(title_str);
 set(gca,'YTick',log10([0.1 1 10]), ...
         'YTickLabel',{'0.1','1','10'});
 
-pbaspect([35 1 3]);% for chani
+pbaspect([35 1 3]); % for changing the size  
 view([-60 5]); % for chaning angel
 axis tight; box on; grid on;
 end
 
-%% ========================================================================
-%  Utility: load epsilon file robustly
-%  ========================================================================
+%  load epsilon 
 function [t, e] = grab_data_simple(S)
 
 names = fieldnames(S);

@@ -6,7 +6,7 @@ function simulation_runner
 %    - attenuation_depth_factor   = 0.5   (mu increases with depth)
 %    - NPP_rate                   = 3e-5  day^-1
 %    - NPP finite bloom: on until day 10, off afterwards
-%    - Stronger  isaggregation
+%    - Stronger  disaggregation
 
 clc;
 mu_tuned        = 0.12;
