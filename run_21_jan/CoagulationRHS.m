@@ -5,15 +5,14 @@ classdef CoagulationRHS < handle
     %
     % NEW-2025-12-21 (CRITICAL UNITS FIX):
     % Solver time is in DAYS, so RHS must return dv/dt in [per day].
-    % Any scaling by day_to_sec or z_max is WRONG here.
     %
     % NEW-2026-01-11 (DISAGG FIX):
     % Disaggregation.applyWithScaling is an instantaneous mapping Y -> Ynew.
-    % To use inside an ODE RHS, it must be converted into a tendency:
+    % To use inside an ODE RHS, convert into a tendency:
     %   dY/dt|disagg = disagg_rate * (Y_after - Y_before)   [per day]
     %
     % NEW-2026-01-11 (GRID FIX):
-    % Fix: add helper getSectionGrid() and use it everywhere we call
+    % Adds helper getSectionGrid() and use it everywhere we call
     % Disaggregation.applyWithScaling.
     %
     % NEW-2026-01-14 (BETA ORIENTATION SWITCH):
@@ -23,44 +22,46 @@ classdef CoagulationRHS < handle
     % OR
     %   cfg.beta_fix_b1_b3 = true
     %
-    % Default remains legacy (no transpose).
-    %
     % NEW-2026-01-14 (STEP-1 BUGFIX):
     % Legacy disagg matrices (disaggMinus/disaggPlus) must NOT act when
-    % cfg.enable_disagg == false. Previously, they were applied whenever
-    % ~use_new_disagg, even if enable_disagg=false.
+    % cfg.enable_disagg == false.
     %
-    % NEW-2026-01-15 
-    % Adds explicit PP source injection dv_pp (surface-only by default).
-    % Controlled by SimulationConfig:
-    %   cfg.enable_pp (true/false)
-    %   cfg.pp_rate   [# cm^-3 d^-1]
-    %   cfg.pp_bin    (1..Ns)
-    %   cfg.pp_layer  (1..Nz) for column mode
+    % NEW-2026-01-15 (PP SOURCE FIXED FOR AREAL UNITS):
+    % Adds explicit PP source injection dv_pp into (pp_bin, pp_layer).
     %
-    % IMPORTANT:
-    % This is NOT growth_mode='pp'. That legacy mode is kept as-is
-    % (mu*v(1) test). This new term is an additive source into a bin/layer.
+    % IMPORTANT BEHAVIOR (NO pp_rate_units PROPERTY REQUIRED):
+    % - If cfg.export_weight == "vbin": cfg.pp_rate is interpreted as
+    %       pp_rate_areal = [cm^3 / cm^2 / day]
+    %   and we convert to a concentration tendency (state/day) as:
+    %       dv_pp = pp_rate_areal / (wbin(pp_bin) * dz_cm)
+    %   where wbin is bin volume [cm^3/particle], dz_cm is layer thickness [cm].
+    %
+    % - Otherwise: cfg.pp_rate is interpreted as already being in state units/day.
+    %
+    % NEW-2026-01-XX (COAG BV CLOSURE):
+    % If cfg.enforce_coag_bv_closure == true, enforce:
+    %   sum_s ( Vbin(s) * dv_coag(s) ) = 0
+    % per layer (and in 0-D), by applying a minimal correction to the last bin.
+    % This fixes leakage caused by overflow pairs (Vp > Vmax) that get clipped.
     %
     % NOTE:
     % This file supports BOTH:
     %   terms = rhs.decomposeTerms(t,v)          % struct
     %   [dv_tot,dv_lin,dv_coag,dv_pp,dv_disagg,dv_other] = rhs.decomposeTerms(t,v)
-    % so older scripts won't break.
 
     properties
-        betas;          % BetaMatrices object, contains coagulation parameters
-        linear;         % Linear matrix (growth - sinking) OR column operator
+        betas;          % BetaMatrices object
+        linear;         % Linear operator (0-D) OR column operator (Ns*Nz x Ns*Nz)
         disaggMinus;    % Disaggregation loss matrix (Ns x Ns)
         disaggPlus;     % Disaggregation gain matrix (Ns x Ns)
-        config;         % SimulationConfig object, stores configuration parameters
+        config;         % SimulationConfig object
 
         eps_time = [];     % time vector [d]
-        eps_vals = [];     % epsilon(t) [vector OR Nt x Nz]  (NOTE: we store matrices as Nt x Nz)
+        eps_vals = [];     % epsilon(t) [vector OR Nt x Nz]  (stored as Nt x Nz when possible)
         eps_const = [];    % fallback constant epsilon
 
-        grid = [];         % DerivedGrid (optional; required for new disagg)
-        z_cache = [];      % cache z-centers from config (m)
+        grid = [];         % DerivedGrid (optional; REQUIRED for vbin PP conversion and new disagg)
+        z_cache = [];      % cached z-centers (m)
     end
 
     methods
@@ -86,7 +87,7 @@ classdef CoagulationRHS < handle
                 end
             end
 
-            % cache depth grid if possible (safe)
+            % cache depth grid if possible
             try
                 if ismethod(config,'getZ')
                     obj.z_cache = config.getZ();
@@ -100,7 +101,6 @@ classdef CoagulationRHS < handle
         % NEW-2026-01-14: beta orientation helper (safe default)
         % ==========================================================
         function [b1,b2,b3,b4,b5] = getBetasForRHS(obj)
-            % Defaults (legacy)
             b1 = obj.betas.b1;
             b2 = obj.betas.b2;
             b3 = obj.betas.b3;
@@ -109,7 +109,6 @@ classdef CoagulationRHS < handle
 
             mode = "legacy";
 
-            % Preferred string switch
             try
                 if isprop(obj.config,'beta_row_form') && ~isempty(obj.config.beta_row_form)
                     mode = lower(string(obj.config.beta_row_form));
@@ -117,7 +116,6 @@ classdef CoagulationRHS < handle
             catch
             end
 
-            % Back-compat boolean switch
             try
                 if mode == "legacy"
                     if isprop(obj.config,'beta_fix_b1_b3') && ~isempty(obj.config.beta_fix_b1_b3) && logical(obj.config.beta_fix_b1_b3)
@@ -127,17 +125,57 @@ classdef CoagulationRHS < handle
             catch
             end
 
-            % Apply the rule: transpose ONLY b1 and b3
             if mode == "row_nrm" || mode == "row_nr_m" || mode == "row"
                 b1 = b1.';   % transpose b1
                 b3 = b3.';   % transpose b3
             end
         end
 
+        % ==========================================================
+        % NEW-2026-01-XX: coag biovolume closure helper
+        % ==========================================================
+        function dvk = applyCoagBvClosure(obj, dvk)
+            do_closure = false;
+            try
+                if isprop(obj.config,'enforce_coag_bv_closure') && ~isempty(obj.config.enforce_coag_bv_closure)
+                    do_closure = logical(obj.config.enforce_coag_bv_closure);
+                end
+            catch
+                do_closure = false;
+            end
+            if ~do_closure
+                return;
+            end
+
+            V = [];
+            try
+                if ~isempty(obj.grid) && isprop(obj.grid,'av_vol') && ~isempty(obj.grid.av_vol)
+                    V = obj.grid.av_vol(:); % cm^3 per particle
+                end
+            catch
+                V = [];
+            end
+            if isempty(V)
+                % do not crash; just skip
+                return;
+            end
+
+            dvk = dvk(:);
+            if numel(dvk) ~= numel(V)
+                return;
+            end
+
+            leak = sum(dvk .* V); % (state/day)*(cm^3/particle)
+            if ~isfinite(leak) || leak == 0
+                return;
+            end
+
+            if V(end) > 0
+                dvk(end) = dvk(end) - leak / V(end);
+            end
+        end
+
         function setEpsilonSeries(obj, t, eps_vals)
-            % Stores:
-            % - vector eps_vals as [Nt x 1]
-            % - matrix eps_vals internally as [Nt x Nz] (IMPORTANT)
             obj.eps_time = t(:);
 
             if isvector(eps_vals)
@@ -150,31 +188,21 @@ classdef CoagulationRHS < handle
                 return;
             end
 
-            % ---------- NEW: robust orientation handling ----------
             Nt = numel(obj.eps_time);
 
             % Case A: already Nt x Nz
             if size(eps_vals,1) == Nt
-                obj.eps_vals = eps_vals; % Nt x Nz
+                obj.eps_vals = eps_vals;
                 return;
             end
 
-            % Case B: Nz x Nt  -> transpose to Nt x Nz
+            % Case B: Nz x Nt -> transpose to Nt x Nz
             if size(eps_vals,2) == Nt && size(eps_vals,1) ~= Nt
-                obj.eps_vals = eps_vals.'; % Nt x Nz
+                obj.eps_vals = eps_vals.';
                 return;
             end
 
-            % OLD (kept): previous heuristic (not reliable for Nz x Nt)
-            % try
-            %     if size(eps_vals,2) == Nt && size(eps_vals,1) ~= Nt
-            %         eps_vals = eps_vals.';
-            %     end
-            % catch
-            % end
-
-            % Fallback: store as-is (but later getEpsAtLayer tries both)
-            obj.eps_vals = eps_vals;
+            obj.eps_vals = eps_vals; % fallback
         end
 
         function setGrid(obj, gridObj)
@@ -182,7 +210,7 @@ classdef CoagulationRHS < handle
         end
 
         % --------------------------------------------------------------
-        % NEW: always return a valid "section grid" for Disaggregation
+        % Always return a valid "section grid" for Disaggregation
         % --------------------------------------------------------------
         function gridS = getSectionGrid(obj)
             gridS = obj.grid;
@@ -213,30 +241,24 @@ classdef CoagulationRHS < handle
                     'obj.grid does not implement getConservedRadii/getFractalRadii and no fallback radii found.');
             end
 
-            % IMPORTANT: this is a separate file SectionGridAdapter.m
             gridS = SectionGridAdapter(rv, obj.config);
         end
 
         function dvdt = rhs(obj, t, v)
-    dvdt = obj.evaluate(t, v);
+            dvdt = obj.evaluate(t, v);
 
-    % --- hard safety: stop immediately if RHS is invalid ---
-    if any(~isfinite(dvdt))
-        error('CoagulationRHS:NaNInf', ...
-              'RHS produced NaN/Inf at t=%.6g. min=%g max=%g', ...
-              t, min(dvdt(~isnan(dvdt))), max(dvdt(~isnan(dvdt))));
-    end
-end
+            if any(~isfinite(dvdt))
+                error('CoagulationRHS:NaNInf', ...
+                      'RHS produced NaN/Inf at t=%.6g. min=%g max=%g', ...
+                      t, min(dvdt(~isnan(dvdt))), max(dvdt(~isnan(dvdt))));
+            end
+        end
 
         function eps_now = getEpsScalar(obj, t)
-            % Scalar epsilon fallback:
-            % - vector eps_vals -> interp in time
-            % - matrix eps_vals -> use time-interp of layer-1 if possible
             eps_now = [];
 
             if ~isempty(obj.eps_time) && ~isempty(obj.eps_vals)
 
-                % Vector case
                 if isvector(obj.eps_vals)
                     Nt = numel(obj.eps_time);
                     Ne = numel(obj.eps_vals);
@@ -249,18 +271,14 @@ end
                         eps_now = [];
                     end
 
-                % Matrix case (try layer 1)
                 else
                     try
                         tt = obj.eps_time(:);
                         Em = obj.eps_vals;
 
-                        % If Em is Nt x Nz
-                        if size(Em,1) == numel(tt)
+                        if size(Em,1) == numel(tt)          % Nt x Nz
                             eps_now = interp1(tt, Em(:,1), t, 'linear', 'extrap');
-
-                        % If Em is Nz x Nt
-                        elseif size(Em,2) == numel(tt)
+                        elseif size(Em,2) == numel(tt)      % Nz x Nt
                             eps_now = interp1(tt, Em(1,:).', t, 'linear', 'extrap');
                         end
                     catch
@@ -282,16 +300,12 @@ end
         end
 
         % ==========================================================
-        % NEW: epsilon at a specific layer (robust Nz x Nt OR Nt x Nz)
-        % Priority:
-        %   1) cfg.eps_fun(t,z)
-        %   2) cfg.epsilon_time + cfg.epsilon_series (either orientation)
-        %   3) getEpsScalar(t) fallback
+        % Epsilon at a specific layer (robust Nz x Nt OR Nt x Nz)
         % ==========================================================
         function eps_here = getEpsAtLayer(obj, t, k, zc_k)
             eps_here = [];
 
-            % 1) eps_fun
+            % 1) eps_fun(t,z)
             try
                 if isprop(obj.config,'eps_fun') && ~isempty(obj.config.eps_fun) && isa(obj.config.eps_fun,'function_handle')
                     eps_here = obj.config.eps_fun(t, zc_k);
@@ -313,14 +327,11 @@ end
                     tt = obj.config.epsilon_time(:);
                     Em = obj.config.epsilon_series;
 
-                    % Case A: Nt x Nz
-                    if ~isvector(Em) && size(Em,1) == numel(tt)
+                    if ~isvector(Em) && size(Em,1) == numel(tt)       % Nt x Nz
                         if k <= size(Em,2)
                             eps_here = interp1(tt, Em(:,k), t, 'linear', 'extrap');
                         end
-
-                    % Case B: Nz x Nt
-                    elseif ~isvector(Em) && size(Em,2) == numel(tt)
+                    elseif ~isvector(Em) && size(Em,2) == numel(tt)   % Nz x Nt
                         if k <= size(Em,1)
                             eps_here = interp1(tt, Em(k,:).', t, 'linear', 'extrap');
                         end
@@ -343,7 +354,7 @@ end
         end
 
         % ==========================================================
-        % NEW-2026-01-15: PP source helper 
+        % PP source helper (FIXED)
         % ==========================================================
         function dv_pp = getPPSourceVector(obj, v)
             v = v(:);
@@ -361,7 +372,7 @@ end
                 return;
             end
 
-            % rate
+            % rate (meaning depends on export_weight)
             pp_rate = 0.0;
             try
                 if isprop(obj.config,'pp_rate') && ~isempty(obj.config.pp_rate)
@@ -376,6 +387,7 @@ end
 
             % indices
             Ns = obj.config.n_sections;
+
             pp_bin = 1;
             try
                 if isprop(obj.config,'pp_bin') && ~isempty(obj.config.pp_bin)
@@ -386,10 +398,19 @@ end
             end
             pp_bin = max(1, min(Ns, pp_bin));
 
+            % decide interpretation of pp_rate
+            is_vbin = false;
+            try
+                if isprop(obj.config,'export_weight') && ~isempty(obj.config.export_weight)
+                    is_vbin = strcmpi(string(obj.config.export_weight),"vbin");
+                end
+            catch
+                is_vbin = false;
+            end
+
             if isprop(obj.config,'use_column') && obj.config.use_column
                 Nz = obj.config.getNumLayers();
 
-                % safety: enforce expected state length in column
                 if numel(v) ~= Ns * Nz
                     error('PP source: state length mismatch. Expected %d, got %d.', Ns*Nz, numel(v));
                 end
@@ -404,11 +425,35 @@ end
                 end
                 pp_layer = max(1, min(Nz, pp_layer));
 
-                % flat index for Ns x Nz stored column-wise as [:]
                 idx = (pp_layer-1)*Ns + pp_bin;
-                dv_pp(idx) = dv_pp(idx) + pp_rate;
+
+                if is_vbin
+                    % pp_rate is AREAL biovolume production: [cm^3/cm^2/day]
+                    if isempty(obj.grid)
+                        error('PP source (vbin): obj.grid is empty. Pass grid into CoagulationRHS or call rhs.setGrid(grid).');
+                    end
+
+                    dz_cm = obj.config.dz * 100;
+
+                    % wbin (cm^3/particle)
+                    try
+                        wbin = obj.grid.getBinVolumes();
+                    catch
+                        wbin = Disaggregation.getBinVolumes_cm3(obj.grid);
+                    end
+                    wbin = wbin(:);
+
+                    dv_pp(idx) = dv_pp(idx) + pp_rate / (wbin(pp_bin) * dz_cm);  % state/day
+                else
+                    % pp_rate is already in state units/day
+                    dv_pp(idx) = dv_pp(idx) + pp_rate;
+                end
 
             else
+                % 0-D
+                if is_vbin
+                    error('PP source (vbin): 0-D mode not supported for areal pp_rate.');
+                end
                 if pp_bin >= 1 && pp_bin <= numel(v)
                     dv_pp(pp_bin) = dv_pp(pp_bin) + pp_rate;
                 end
@@ -418,13 +463,13 @@ end
         function dvdt = evaluate(obj, t, v)
             Ns = obj.config.n_sections;
 
-            % hard coag switch
+            % coag switch
             enable_coag = true;
             if isprop(obj.config,'enable_coag') && ~isempty(obj.config.enable_coag)
                 enable_coag = logical(obj.config.enable_coag);
             end
 
-            % hard disagg switch (legacy matrices MUST obey enable_disagg)
+            % disagg switch (legacy matrices must obey enable_disagg)
             enable_disagg = false;
             try
                 if isprop(obj.config,'enable_disagg') && ~isempty(obj.config.enable_disagg)
@@ -443,7 +488,7 @@ end
                 clip_negative = logical(obj.config.clip_negative);
             end
 
-            % Disaggregation switch (new disagg-in-RHS mapping)
+            % new disagg switch
             use_new_disagg = false;
             if isprop(obj.config,'enable_disagg') && ~isempty(obj.config.enable_disagg)
                 if logical(obj.config.enable_disagg)
@@ -471,7 +516,7 @@ end
             disagg_rate = max(disagg_rate, 0.0);
 
             % split state
-            v_lin = v;  % RAW for linear
+            v_lin = v;
             if clip_negative
                 v_nl = max(v, 0);
             else
@@ -485,7 +530,7 @@ end
             end
             mu = obj.config.growth;
 
-            % betas (orientation-safe)
+            % betas
             [b1,b2,b3,b4,b5] = obj.getBetasForRHS();
 
             % ==========================================================
@@ -498,7 +543,7 @@ end
                     error('Column RHS: state length mismatch. Expected %d, got %d.', Ns*Nz, numel(v));
                 end
 
-                N  = reshape(v_nl, [Ns, Nz]);   % Ns x Nz
+                N  = reshape(v_nl, [Ns, Nz]);
                 dN = zeros(Ns, Nz);
 
                 % z-grid
@@ -522,15 +567,13 @@ end
                 for k = 1:Nz
                     vk = N(:, k);
 
-                    % ---------- NEW: robust epsilon at layer ----------
                     eps_here = obj.getEpsAtLayer(t, k, zc(k));
 
-                    % NEW disagg as RATE term
+                    % new disagg as rate term
                     dv_disagg_k = zeros(size(vk));
                     if use_new_disagg && disagg_rate > 0
                         if ~isempty(eps_here) && isfinite(eps_here) && eps_here > 0
 
-                            % eps_ref: prefer config value if present, else eps_here
                             eps_ref = eps_here;
                             try
                                 if isprop(obj.config,'eps_ref') && ~isempty(obj.config.eps_ref)
@@ -554,7 +597,7 @@ end
                         end
                     end
 
-                    % coag terms
+                    % coag
                     vk_safe  = max(vk, 0);
                     vk_r     = vk_safe';
                     vk_shift = [0, vk_r(1:Ns-1)];
@@ -575,6 +618,10 @@ end
 
                     dvk = (term1 + term2)';
 
+                    % NEW: enforce biovolume closure for coag (per layer)
+                    % (REMOVED the old duplicate BV-closure block here)
+                    dvk = obj.applyCoagBvClosure(dvk);
+
                     % legacy matrix disagg (ONLY when enable_disagg==true)
                     if ~use_new_disagg
                         if enable_disagg
@@ -586,17 +633,17 @@ end
                     dN(:, k) = dvk;
                 end
 
-                % linear column operator on RAW state
+                % linear operator on RAW state
                 term3_flat = obj.linear * v_lin;
                 term3 = reshape(term3_flat, [Ns, Nz]);
                 dN = dN + term3;
 
-                % OLD (kept): legacy growth_mode == "pp" (mu*v(1) test)
+                % legacy growth_mode == "pp"
                 if growth_mode == "pp"
                     dN(1,1) = dN(1,1) + mu * v_lin(1);
                 end
 
-                % NEW-2026-01-15: explicit PP SOURCE term 
+                % explicit PP source
                 dv_pp = obj.getPPSourceVector(v_lin);
                 if any(dv_pp ~= 0)
                     dN = dN + reshape(dv_pp, [Ns, Nz]);
@@ -604,12 +651,11 @@ end
 
                 dvdt = dN(:);
 
-                % debug check
+                % debug
                 try
                     if isprop(obj.config,'debug_rhs_units') && logical(obj.config.debug_rhs_units)
                         dv_lin_dbg = obj.linear * v_lin;
                         dv_rhs_dbg = dvdt;
-
                         fprintf('[DEBUG RHS UNITS] t=%.4f d | ||A*v||_inf=%.3e | ||rhs||_inf=%.3e | ratio=%.3f\n', ...
                             t, norm(dv_lin_dbg, inf), norm(dv_rhs_dbg, inf), norm(dv_lin_dbg, inf)/max(norm(dv_rhs_dbg, inf), eps));
                     end
@@ -675,31 +721,31 @@ end
                 end
             end
 
-            dvdt = (term1 + term2)' + term3 + term4 + term5 + dv_disagg;
+            % NEW: apply closure to the coag part in 0-D
+            dv_coag0 = (term1 + term2).';
+            dv_coag0 = obj.applyCoagBvClosure(dv_coag0);
 
-            % OLD (kept): legacy growth_mode == "pp" (mu*v(1) test)
+            dvdt = dv_coag0 + term3 + term4 + term5 + dv_disagg;
+
             if growth_mode == "pp"
                 dvdt(1) = dvdt(1) + mu * v_lin(1);
             end
 
-            % NEW-2026-01-15: explicit PP SOURCE term 
             dvdt = dvdt + obj.getPPSourceVector(v_lin);
         end
 
         % ==========================================================
-        % Diagnostics decomposition (UPDATED, no deletion)
+        % Diagnostics decomposition (UPDATED)
         % ==========================================================
         function varargout = decomposeTerms(obj, t, v)
             v = v(:);
 
-            % total RHS (ground truth)
             dv_tot = obj.rhs(t, v);
 
-            % linear on RAW v (matches evaluate())
             v_raw  = v;
             dv_lin = obj.linear * v_raw;
 
-            % PP term (UPDATED)
+            % PP term (legacy + explicit)
             dv_pp = zeros(size(v));
 
             growth_mode = "shift";
@@ -710,13 +756,11 @@ end
             catch
             end
 
-            % OLD (kept): legacy growth_mode == "pp"
             if growth_mode == "pp"
                 mu = obj.config.growth;
                 dv_pp(1) = dv_pp(1) + mu * v_raw(1);
             end
 
-            % NEW: explicit PP source term
             dv_pp = dv_pp + obj.getPPSourceVector(v_raw);
 
             % switches (same logic as evaluate)
@@ -794,7 +838,6 @@ end
                     if numel(v) == Ns*Nz
                         N = reshape(max(v,0), [Ns, Nz]);
 
-                        % z grid
                         zc = [];
                         try
                             if ~isempty(obj.z_cache) && numel(obj.z_cache) == Nz
@@ -815,7 +858,6 @@ end
                         for k = 1:Nz
                             vk_before = N(:,k);
 
-                            % ---------- NEW: robust epsilon at layer ----------
                             eps_here = obj.getEpsAtLayer(t, k, zc(k));
 
                             if ~isempty(eps_here) && isfinite(eps_here) && eps_here > 0
@@ -896,7 +938,9 @@ end
                             term2 = vk_r * b1;
                             term2 = term2 .* vk_shift;
 
-                            dNcoag(:,k) = (term1 + term2).';
+                            tmp = (term1 + term2).';
+                            tmp = obj.applyCoagBvClosure(tmp);
+                            dNcoag(:,k) = tmp;
                         end
 
                         dv_coag = dNcoag(:);
@@ -915,13 +959,12 @@ end
                     term2 = term2 .* v_shift;
 
                     dv_coag = (term1 + term2).';
+                    dv_coag = obj.applyCoagBvClosure(dv_coag);
                 end
             end
 
-            % remainder
             dv_other = dv_tot - (dv_lin + dv_pp + dv_coag + dv_disagg);
 
-            % package
             S = struct();
             S.dv_tot    = dv_tot;
             S.dv_lin    = dv_lin;
@@ -935,7 +978,6 @@ end
                 return;
             end
 
-            % legacy multi-output (kept)
             varargout{1} = dv_tot;
             if nargout >= 2, varargout{2} = dv_lin;    end
             if nargout >= 3, varargout{3} = dv_coag;   end
@@ -999,8 +1041,7 @@ end
                     J(1,1) = J(1,1) + mu;
                 end
 
-                % NEW-2026-01-15: explicit PP source is additive constant,
-                % so it has ZERO Jacobian contribution. (Nothing to add.)
+                % explicit PP source is additive constant => zero Jacobian
                 return;
             end
 

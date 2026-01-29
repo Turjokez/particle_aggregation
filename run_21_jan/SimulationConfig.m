@@ -38,7 +38,7 @@ classdef SimulationConfig < handle
         gamma = 0.1;            % Average shear rate [s^{-1}]
 
         growth = 0.15;          % [d^{-1}]
-        growth_mode = 'shift';  % 'shift' (legacy) or 'pp' 
+        growth_mode = 'shift';  % 'shift' (legacy) or 'pp'
 
         gro_sec = 4;            % legacy shift start section
         num_1 = 1e3;            % legacy
@@ -95,6 +95,8 @@ classdef SimulationConfig < handle
         disagg_beta = 0.35;
         disagg_frac_to_edge = 1/3;
         disagg_redistribute_p = 0;
+        enforce_coag_bv_closure = false;   % force coag to conserve biovolume by correcting last bin
+        debug_coag_leak         = false;   % print leak info at runtime (optional)
 
         % Optional: time-varying epsilon forcing (for pulses)
         epsilon_time = [];
@@ -129,7 +131,7 @@ classdef SimulationConfig < handle
         beta_fix_b1_b3 = false;
 
         % ==========================================================
-        % NEW-2026-01-15: explicit PP SOURCE term 
+        % NEW-2026-01-15: explicit PP SOURCE term
         % ==========================================================
         enable_pp = false;
         pp_rate   = 0.0;
@@ -139,7 +141,7 @@ classdef SimulationConfig < handle
         % ==========================================================
         % NEW-2026-01-20: consistent export/inventory bin-weight mode
         % ==========================================================
-        export_weight = "ones";   % "ones" or "vbin"
+        export_weight = "vbin";   % "ones" or "vbin"  <-- UPDATED DEFAULT
     end
 
     methods
@@ -330,6 +332,12 @@ classdef SimulationConfig < handle
                     assert(isfinite(obj.pp_layer) && obj.pp_layer >= 1 && obj.pp_layer <= Nz, ...
                         'pp_layer must be between 1 and Nz for column mode');
                 end
+            end
+
+            % NEW: validate export_weight
+            if isprop(obj,'export_weight') && ~isempty(obj.export_weight)
+                ew = lower(string(obj.export_weight));
+                assert(any(ew == ["ones","vbin"]), 'export_weight must be "ones" or "vbin".');
             end
         end
 

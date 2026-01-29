@@ -117,7 +117,98 @@ classdef CoagulationSimulation < handle
             obj.rhs = [];
             obj.result = struct();
         end
-
+        function buildRHS(obj)
+            %BUILDRHS Build betas + RHS WITHOUT solving ODEs.
+            % This lets you do: sim.initializeComponents(); sim.buildRHS(); sim.rhs.rhs(...)
+        
+            % If grid/operators are missing, build them first
+            if isempty(obj.grid) || isempty(obj.operators) || isempty(obj.assembler)
+                obj.initializeComponents();
+            end
+        
+            % Decide if coagulation is OFF
+            coag_is_off = false;
+        
+            try
+                if isprop(obj.config,'enable_coag') && ~isempty(obj.config.enable_coag) && ~logical(obj.config.enable_coag)
+                    coag_is_off = true;
+                end
+            catch
+            end
+        
+            try
+                if isprop(obj.config,'coag_scale') && ~isempty(obj.config.coag_scale) && obj.config.coag_scale == 0
+                    coag_is_off = true;
+                end
+            catch
+            end
+        
+            try
+                if isprop(obj.config,'beta_scale') && ~isempty(obj.config.beta_scale) && obj.config.beta_scale == 0
+                    coag_is_off = true;
+                end
+            catch
+            end
+        
+            try
+                if isprop(obj.config,'kernel_scale') && ~isempty(obj.config.kernel_scale) && obj.config.kernel_scale == 0
+                    coag_is_off = true;
+                end
+            catch
+            end
+        
+            % Build betas
+            if coag_is_off
+                Ns = obj.config.n_sections;
+                betas = BetaMatrices();
+                betas.b1  = zeros(Ns,Ns);
+                betas.b2  = zeros(Ns,Ns);
+                betas.b3  = zeros(Ns,Ns);
+                betas.b4  = zeros(Ns,Ns);
+                betas.b5  = zeros(Ns,Ns);
+                betas.b25 = zeros(Ns,Ns);
+            else
+                b_brown = obj.assembler.computeFor('KernelBrown');
+                b_shear = obj.assembler.computeFor('KernelCurSh');
+                b_ds    = obj.assembler.computeFor('KernelCurDS');
+                betas   = obj.assembler.combineAndScale(b_brown, b_shear, b_ds);
+            end
+        
+            obj.operators.betas = betas;
+        
+            % Create RHS (pass grid if supported)
+            try
+                obj.rhs = CoagulationRHS(betas, obj.operators.linear, ...
+                    obj.operators.disagg_minus, obj.operators.disagg_plus, obj.config, obj.grid);
+            catch
+                obj.rhs = CoagulationRHS(betas, obj.operators.linear, ...
+                    obj.operators.disagg_minus, obj.operators.disagg_plus, obj.config);
+                try
+                    if ismethod(obj.rhs,'setGrid')
+                        obj.rhs.setGrid(obj.grid);
+                    end
+                catch
+                end
+            end
+        
+            % Pass scalar eps(t) if available
+            if ~isempty(obj.epsilon_time) && ~isempty(obj.epsilon_values)
+                try
+                    if ismethod(obj.rhs,'setEpsilonSeries')
+                        obj.rhs.setEpsilonSeries(obj.epsilon_time, obj.epsilon_values);
+                    end
+                catch
+                end
+            end
+        
+            % Validate RHS
+            try
+                if ~isempty(obj.rhs) && ismethod(obj.rhs,'validate')
+                    obj.rhs.validate();
+                end
+            catch
+            end
+        end
         function verifyNoShadowing(obj) %#ok<MANU>
             try
                 fprintf('[INFO] which CoagulationSimulation: %s\n', which('CoagulationSimulation'));

@@ -99,6 +99,7 @@ classdef BetaAssembler < handle
     end
 
     methods (Access = private)
+
         function betas = computeBetaMatrices(obj)
             % Complete implementation ported from CalcBetas.m
             n_sections = obj.config.n_sections;
@@ -225,6 +226,24 @@ classdef BetaAssembler < handle
             % Take account of double counting on the super-diagonal
             b1 = b1 - 0.5 * diag(diag(b1, 1), 1);
 
+            % =============================================================
+            % NEW-2026-01-XX (OVERFLOW FIX):
+            % Catch collisions that produce Vi+Vj > v_upper(end) and
+            % accumulate the GAIN into the last bin instead of losing it.
+            % Controlled by cfg.fix_overflow_to_last_bin (default false).
+            % =============================================================
+            try
+                do_fix = false;
+                if isprop(obj.config,'fix_overflow_to_last_bin') && ~isempty(obj.config.fix_overflow_to_last_bin)
+                    do_fix = logical(obj.config.fix_overflow_to_last_bin);
+                end
+                if do_fix
+                    [b1,b2] = obj.applyOverflowFix(b1,b2,int_param);
+                end
+            catch ME
+                warning('BetaAssembler: overflow fix failed: %s', ME.message);
+            end
+
             % Create BetaMatrices object
             betas = BetaMatrices();
             betas.b1 = b1;
@@ -239,6 +258,46 @@ classdef BetaAssembler < handle
             % -------------------------------------------------------------
             % NEW: keep b25 as a diagnostic only
             betas.b25 = b2 - b3 - b4 - b5;
+        end
+
+        function [b1,b2] = applyOverflowFix(obj, b1, b2, int_param)
+            % =============================================================
+            % NEW-2026-01-XX: overflow catcher at bin-mean level.
+            % This is a pragmatic fix: if Vav(i)+Vav(j) exceeds max volume,
+            % add the corresponding gain into the last bin column.
+            % =============================================================
+            Ns   = obj.config.n_sections;
+            Vav  = obj.grid.av_vol(:);
+            Vmax = obj.grid.v_upper(end);
+            jL   = Ns;
+
+            kernel_func = KernelLibrary.getKernel(int_param.kernel);
+
+            for jcol = 1:Ns
+                for irow = 1:Ns
+                    if (Vav(irow) + Vav(jcol)) > Vmax
+
+                        mi = Vav(irow);
+                        mj = Vav(jcol);
+
+                        % radii at bin means
+                        ri  = int_param.amfrac * mi^(int_param.bmfrac);
+                        rj  = int_param.amfrac * mj^(int_param.bmfrac);
+                        rvi = (0.75/pi * mi)^(1/3);
+                        rvj = (0.75/pi * mj)^(1/3);
+
+                        % kernel at mean sizes
+                        Kij = kernel_func([ri; rj], [rvi; rvj], int_param);
+
+                        % add into last-bin gain (same normalization style family)
+                        denom = max(mi*mj, eps);
+                        b2(irow, jL) = b2(irow, jL) + Kij / denom;
+
+                        % keep b1 unchanged here (placeholder for future refinement)
+                        % b1(irow, jL) = b1(irow, jL) + 0;
+                    end
+                end
+            end
         end
 
         % Integration functions for case 5

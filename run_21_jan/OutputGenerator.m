@@ -11,6 +11,17 @@ classdef OutputGenerator < handle
     %     export_weight = "ones"  (number-like)
     %     export_weight = "vbin"  (volume-like)
     % - Keeps all old fields; adds new weighted fields so nothing breaks.
+    %
+    % NEW-2026-01-23 (CRITICAL UNIT FIX):
+    % - Support state units: Y can be per m^3 OR per cm^3.
+    % - If cfg.state_units == "m3", convert N from #/m^3 -> #/cm^3 using 1e-6.
+    % - Adds cm^2-based flux/inventory fields to avoid 1e4 confusion:
+    %     bottom_fluxsect_*_cm3cm2d, column_total_*_cm3cm2, etc.
+    %
+    % NEW-2026-01-23 (ADRIAN BUDGET READY):
+    % - Adds "best" fields in BOTH m^2 and cm^2:
+    %     total_mass_best_cm3cm2, total_flux_best_cm3cm2d, etc.
+    % - Keeps plot compatibility (fluxspec_i remains per m^2/day).
 
     methods (Static)
 
@@ -42,6 +53,24 @@ classdef OutputGenerator < handle
                     % v = [N(:,1); N(:,2); ...; N(:,Nz)]  where N is Ns x Nz
                     N2 = reshape(Y(it, :)', [Ns, Nz]);     % Ns x Nz (sec x z)
                     Y3(it, :, :) = permute(N2, [2 1]);    % Nz x Ns
+                end
+
+                % ======================================================
+                % NEW-2026-01-23: STATE UNITS HANDLING
+                % Default keeps old behavior (assume per cm^3).
+                % If config.state_units == "m3", convert to per cm^3.
+                % ======================================================
+                state_units = "cm3";
+                try
+                    if isprop(config,'state_units') && ~isempty(config.state_units)
+                        state_units = string(config.state_units);
+                    end
+                catch
+                end
+
+                N_to_cm3 = 1.0;
+                if strcmpi(state_units,"m3") || strcmpi(state_units,"per_m3")
+                    N_to_cm3 = 1e-6;  % #/m^3 -> #/cm^3
                 end
 
                 % Radii/diameters
@@ -111,20 +140,37 @@ classdef OutputGenerator < handle
                     weight_mode = "ones";
                 end
 
-                % Inventory per area and export per area
-                % Old fields kept (UNWEIGHTED), new weighted fields added.
+                % ======================================================
+                % Inventory + export arrays
+                % NOTE: We now store BOTH cm^2 and m^2 forms.
+                % ======================================================
+
+                % OLD fields kept (names unchanged)
                 column_inventory_by_section_cm3m2 = zeros(n_times, Ns);
                 column_total_inventory_cm3m2      = zeros(n_times, 1);
 
                 bottom_fluxsect_cm3m2d   = zeros(n_times, Ns);
                 bottom_total_flux_cm3m2d = zeros(n_times, 1);
 
-                % NEW: weighted versions (consistent with weight_mode)
+                % NEW: weighted versions (same naming as you already used)
                 column_inventory_by_section_weighted = zeros(n_times, Ns);
                 column_total_inventory_weighted      = zeros(n_times, 1);
 
                 bottom_fluxsect_weighted   = zeros(n_times, Ns);
                 bottom_total_flux_weighted = zeros(n_times, 1);
+
+                % NEW-2026-01-23: cm^2-based outputs (no 1e4 factor)
+                column_inventory_by_section_cm3cm2 = zeros(n_times, Ns);
+                column_total_inventory_cm3cm2      = zeros(n_times, 1);
+
+                column_inventory_by_section_weighted_cm3cm2 = zeros(n_times, Ns);
+                column_total_inventory_weighted_cm3cm2      = zeros(n_times, 1);
+
+                bottom_fluxsect_cm3cm2d   = zeros(n_times, Ns);
+                bottom_total_flux_cm3cm2d = zeros(n_times, 1);
+
+                bottom_fluxsect_weighted_cm3cm2d   = zeros(n_times, Ns);
+                bottom_total_flux_weighted_cm3cm2d = zeros(n_times, 1);
 
                 % snapshots
                 N_bottom  = zeros(n_times, Ns);
@@ -138,42 +184,58 @@ classdef OutputGenerator < handle
                 Fbin_bottom_weighted = zeros(n_times, Ns);
 
                 for it = 1:n_times
-                    Nlayer = squeeze(Y3(it, :, :));   % Nz x Ns
+                    Nlayer_raw = squeeze(Y3(it, :, :));   % Nz x Ns
 
-                    ysurf = Nlayer(1, :);             % 1 x Ns
-                    ybot  = Nlayer(end, :);           % 1 x Ns
+                    % NEW-2026-01-23: convert to per cm^3 if needed
+                    Nlayer = Nlayer_raw * N_to_cm3;
+
+                    ysurf = Nlayer(1, :);                 % 1 x Ns
+                    ybot  = Nlayer(end, :);               % 1 x Ns
 
                     N_surface(it, :) = ysurf;
                     N_bottom(it, :)  = ybot;
 
                     % --------------------------------------------------
                     % OLD (kept): "inventory" computed from sum(Nlayer)
+                    % These were intended as cm^3/m^2-style diagnostics.
                     % --------------------------------------------------
-                    column_inventory_by_section_cm3m2(it, :) = (sum(Nlayer, 1) * dz_cm) * 1e4;
+                    column_inventory_by_section_cm3cm2(it, :) = (sum(Nlayer, 1) * dz_cm);           % per cm^2
+                    column_total_inventory_cm3cm2(it) = sum(column_inventory_by_section_cm3cm2(it, :));
+
+                    column_inventory_by_section_cm3m2(it, :) = column_inventory_by_section_cm3cm2(it, :) * 1e4;  % per m^2
                     column_total_inventory_cm3m2(it) = sum(column_inventory_by_section_cm3m2(it, :));
 
                     % --------------------------------------------------
                     % NEW: weighted inventory (consistent with export weight)
                     % --------------------------------------------------
-                    column_inventory_by_section_weighted(it, :) = ( (sum(Nlayer, 1) .* (wbin(:)')) * dz_cm ) * 1e4;
+                    column_inventory_by_section_weighted_cm3cm2(it, :) = ( (sum(Nlayer, 1) .* (wbin(:)')) * dz_cm ); % per cm^2
+                    column_total_inventory_weighted_cm3cm2(it) = sum(column_inventory_by_section_weighted_cm3cm2(it, :));
+
+                    column_inventory_by_section_weighted(it, :) = column_inventory_by_section_weighted_cm3cm2(it, :) * 1e4; % per m^2
                     column_total_inventory_weighted(it) = sum(column_inventory_by_section_weighted(it, :));
 
                     % --------------------------------------------------
                     % OLD (kept): bottom flux (unweighted)
                     % --------------------------------------------------
-                    bottom_fluxsect_cm3m2d(it, :)  = (ybot .* set_vel_cmday(:)') * 1e4;
-                    bottom_total_flux_cm3m2d(it)   = sum(bottom_fluxsect_cm3m2d(it, :));
+                    bottom_fluxsect_cm3cm2d(it, :)  = (ybot .* set_vel_cmday(:)');    % per cm^2/day
+                    bottom_total_flux_cm3cm2d(it)   = sum(bottom_fluxsect_cm3cm2d(it, :));
+
+                    bottom_fluxsect_cm3m2d(it, :)   = bottom_fluxsect_cm3cm2d(it, :) * 1e4; % per m^2/day
+                    bottom_total_flux_cm3m2d(it)    = sum(bottom_fluxsect_cm3m2d(it, :));
 
                     % --------------------------------------------------
                     % NEW: bottom flux (weighted)
                     % --------------------------------------------------
-                    Fbin = (ybot(:) .* set_vel_cmday(:) .* wbin(:))' * 1e4; % 1 x Ns
-                    Fbin_bottom_weighted(it, :) = Fbin;
+                    Fbin_cm3cm2d = (ybot(:) .* set_vel_cmday(:) .* wbin(:))';  % 1 x Ns, per cm^2/day
+                    Fbin_bottom_weighted(it, :) = Fbin_cm3cm2d * 1e4;          % keep legacy "per m^2/day" version too
 
-                    bottom_fluxsect_weighted(it, :)  = Fbin;
-                    bottom_total_flux_weighted(it)   = sum(Fbin);
+                    bottom_fluxsect_weighted_cm3cm2d(it, :)  = Fbin_cm3cm2d;
+                    bottom_total_flux_weighted_cm3cm2d(it)   = sum(Fbin_cm3cm2d);
 
-                    % ---- legacy spectra on bottom layer ----
+                    bottom_fluxsect_weighted(it, :)          = Fbin_cm3cm2d * 1e4; % per m^2/day
+                    bottom_total_flux_weighted(it)           = sum(bottom_fluxsect_weighted(it, :));
+
+                    % ---- legacy spectra on bottom layer (uses Nlayer per cm^3 now) ----
                     nspec_v_bottom(it, :)   = ybot ./ (1.5 * grid.v_lower') ./ grid.dwidth';
                     masspec_v_bottom(it, :) = ybot ./ grid.dwidth';
                 end
@@ -182,9 +244,14 @@ classdef OutputGenerator < handle
                 if numel(t) < 2
                     export_cum_cm3m2    = zeros(size(t(:)));
                     export_cum_weighted = zeros(size(t(:)));
+                    export_cum_cm3cm2    = zeros(size(t(:)));
+                    export_cum_weighted_cm3cm2 = zeros(size(t(:)));
                 else
                     export_cum_cm3m2    = cumtrapz(t(:), bottom_total_flux_cm3m2d(:));
                     export_cum_weighted = cumtrapz(t(:), bottom_total_flux_weighted(:));
+
+                    export_cum_cm3cm2    = cumtrapz(t(:), bottom_total_flux_cm3cm2d(:));
+                    export_cum_weighted_cm3cm2 = cumtrapz(t(:), bottom_total_flux_weighted_cm3cm2d(:));
                 end
 
                 % image/volume conversion ratio (legacy)
@@ -195,6 +262,7 @@ classdef OutputGenerator < handle
                 % ======================================================
                 % NEW-2025-12-21 + NEW-2026-01-20:
                 % Define fluxspec_i_bottom consistent with weighted export.
+                % Keep it as per m^2/day for plotting compatibility.
                 % ======================================================
                 fluxspec_i_bottom = Fbin_bottom_weighted;  % [cm^3 m^-2 d^-1 per bin]
 
@@ -207,6 +275,10 @@ classdef OutputGenerator < handle
                 output_data.z  = config.getZ();
                 output_data.dz = config.dz;
 
+                % NEW-2026-01-23: state unit info
+                output_data.state_units = char(state_units);
+                output_data.N_to_cm3 = N_to_cm3;
+
                 % Closure-safe core fields (OLD kept)
                 output_data.column_inventory_by_section_cm3m2 = column_inventory_by_section_cm3m2;
                 output_data.column_total_inventory_cm3m2      = column_total_inventory_cm3m2;
@@ -215,7 +287,7 @@ classdef OutputGenerator < handle
                 output_data.bottom_total_flux_cm3m2d = bottom_total_flux_cm3m2d;
                 output_data.export_cum_cm3m2         = export_cum_cm3m2;
 
-                % NEW weighted fields
+                % NEW weighted fields (OLD names kept)
                 output_data.export_weight_mode = weight_mode;
                 output_data.wbin = wbin(:);
 
@@ -226,6 +298,21 @@ classdef OutputGenerator < handle
                 output_data.bottom_total_flux_weighted = bottom_total_flux_weighted;
                 output_data.export_cum_weighted        = export_cum_weighted;
 
+                % NEW-2026-01-23: cm^2 versions
+                output_data.column_inventory_by_section_cm3cm2 = column_inventory_by_section_cm3cm2;
+                output_data.column_total_inventory_cm3cm2      = column_total_inventory_cm3cm2;
+
+                output_data.column_inventory_by_section_weighted_cm3cm2 = column_inventory_by_section_weighted_cm3cm2;
+                output_data.column_total_inventory_weighted_cm3cm2      = column_total_inventory_weighted_cm3cm2;
+
+                output_data.bottom_fluxsect_cm3cm2d   = bottom_fluxsect_cm3cm2d;
+                output_data.bottom_total_flux_cm3cm2d = bottom_total_flux_cm3cm2d;
+                output_data.export_cum_cm3cm2         = export_cum_cm3cm2;
+
+                output_data.bottom_fluxsect_weighted_cm3cm2d   = bottom_fluxsect_weighted_cm3cm2d;
+                output_data.bottom_total_flux_weighted_cm3cm2d = bottom_total_flux_weighted_cm3cm2d;
+                output_data.export_cum_weighted_cm3cm2         = export_cum_weighted_cm3cm2;
+
                 % Backward compatibility fields
                 output_data.bottom_total_flux = bottom_total_flux_cm3m2d;
                 output_data.total_flux        = bottom_total_flux_cm3m2d;
@@ -235,6 +322,11 @@ classdef OutputGenerator < handle
                 output_data.bottom_total_flux_best = bottom_total_flux_weighted;
                 output_data.total_flux_best        = bottom_total_flux_weighted;
                 output_data.total_mass_best        = column_total_inventory_weighted;
+
+                % NEW-2026-01-23: "best" totals in cm^2 space (for Adrian budget)
+                output_data.bottom_total_flux_best_cm3cm2d = bottom_total_flux_weighted_cm3cm2d;
+                output_data.total_flux_best_cm3cm2d        = bottom_total_flux_weighted_cm3cm2d;
+                output_data.total_mass_best_cm3cm2         = column_total_inventory_weighted_cm3cm2;
 
                 % snapshots
                 output_data.N_bottom  = N_bottom;
@@ -277,6 +369,14 @@ classdef OutputGenerator < handle
                     diag.M_weighted = column_total_inventory_weighted;
                     diag.F_weighted = bottom_total_flux_weighted;
                     diag.ExportCum_weighted = export_cum_weighted;
+
+                    diag.state_units = state_units;
+                    diag.N_to_cm3 = N_to_cm3;
+                    diag.M_cm3cm2 = column_total_inventory_cm3cm2;
+                    diag.F_cm3cm2d = bottom_total_flux_cm3cm2d;
+
+                    diag.M_best_cm3cm2 = output_data.total_mass_best_cm3cm2;
+                    diag.F_best_cm3cm2d = output_data.total_flux_best_cm3cm2d;
 
                     save('plot_diag_oop.mat','diag');
                 catch

@@ -2,29 +2,11 @@ function [outdir, dbg] = run_Diagnostics_FINAL(cfg)
 % run_Diagnostics_FINAL(cfg)
 % Diagnostics suite (single entry point).
 %
-% UPDATE-2026-01-20:
-% - Export size fractions now prefer OutputGenerator export flux:
-%     out.output_data.bottom_fluxsect_weighted   (preferred)
-%     out.output_data.bottom_fluxsect_cm3m2d     (fallback)
-% - Size-bin thresholds now prefer OutputGenerator diameters:
-%     out.output_data.diam_i (cm) -> um
-%   (fallback: radii-based diameter)
-%
-% UPDATE-2026-01-21 (SAFE):
-% - If out.output_data is missing/empty, compute it using OutputGenerator.spectraAndFluxes
-%   so diagnostics always have bottom flux + diameters available.
-% - Weight auto-selection no longer assumes sim.result exists; uses (t,Y) from out.
-% - closureCheck is robust if dv_pp / dv_disagg fields are missing.
-%
-% UPDATE-2026-01-21 (PLOTS, REDUCED FIGURE COUNT):
-% - Size spectra: ALL depths in ONE figure (subplots), many times as lines.
-% - Detective plots (dQ/dt): ONE figure per term, ALL depths as subplots.
-% - Figures saved into subfolders:
-%     outdir/fig_spectra/
-%     outdir/fig_tendencies/
-%
-% Notes:
-% - Uses cfg.t_final / cfg.delta_t (NOT cfg.t_max).
+% UPDATE (BIOVOLUME BUDGET FIX):
+% - DOES NOT require cfg.diag_budget_space (your SimulationConfig does not have it).
+% - Forces MASS BALANCE diagnostics to run in BIOVOLUME space (Vbin weights).
+% - Uses OutputGenerator bottom flux if available.
+% - Correctly handles cm3/cm2/day vs cm3/m2/day flux units.
 
 clc;
 dbg = struct();
@@ -56,7 +38,6 @@ if use_eps_file && ~has_series && ~has_fun
         catch
         end
         if isempty(z_model)
-            % fallback: construct midpoints
             if isprop(cfg,'use_column') && cfg.use_column
                 Nz_tmp = cfg.getNumLayers();
                 z_model = ((0:Nz_tmp-1) + 0.5) * cfg.dz;
@@ -84,8 +65,8 @@ if use_eps_file && ~has_series && ~has_fun
         cfg.epsilon_time   = t_days;
         cfg.epsilon_series = E_model;
 
-        if isprop(cfg,'epsilon_const'), cfg.epsilon_const = []; end
-        if isprop(cfg,'epsilon_interface'), cfg.epsilon_interface = 'series'; end
+        if isprop(cfg,'epsilon_const'),      cfg.epsilon_const = []; end
+        if isprop(cfg,'epsilon_interface'),  cfg.epsilon_interface = 'series'; end
 
         fprintf('Loaded epsilon forcing from %s\n', eps_file);
         fprintf('  time: [%d]  eps(model): [%s]\n', numel(cfg.epsilon_time), mat2str(size(cfg.epsilon_series)));
@@ -147,7 +128,6 @@ save(fullfile(outdir,'out_baseline.mat'),'out','-v7.3');
 
 fprintf('\nSaved outputs to:\n  %s\n\n', outdir);
 
-% Create figure subfolders (reduced clutter)
 figdir_spectra = fullfile(outdir,'fig_spectra');
 figdir_tend    = fullfile(outdir,'fig_tendencies');
 if ~exist(figdir_spectra,'dir'), mkdir(figdir_spectra); end
@@ -158,14 +138,12 @@ if ~exist(figdir_tend,'dir'),    mkdir(figdir_tend);    end
 % ==========================================================
 gridS = sim.rhs.getSectionGrid();
 
-% Radii (fallback geometry)
 if ismethod(gridS,'getConservedRadii')
     r_cm = gridS.getConservedRadii(); r_cm = r_cm(:);
 else
     r_cm = gridS.getFractalRadii();   r_cm = r_cm(:);
 end
 
-% --- Ns (robust across config versions) ---
 Ns = [];
 try
     if isprop(cfg,'n_sections') && ~isempty(cfg.n_sections)
@@ -173,14 +151,7 @@ try
     end
 catch
 end
-
-if isempty(Ns)
-    try
-        Ns = numel(r_cm); % fallback
-    catch
-    end
-end
-
+if isempty(Ns), Ns = numel(r_cm); end
 if isempty(Ns)
     error('Could not determine Ns. Add cfg.n_sections or make sure grid has radii.');
 end
@@ -192,65 +163,90 @@ else
     Nz = 1;
 end
 
-dz_cm = cfg.dz * 100;  % meters -> cm
+dz_cm = cfg.dz * 100;
 
-[w, wname, wdbg] = getConservedWeight_AUTO(cfg, sim, gridS, r_cm, Ns, Nz, dz_cm, t, Y);
+% weights
+w_num = ones(Ns,1);
+
+w_vbin = [];
+try
+    if ismethod(gridS,'getBinVolumes')
+        w_vbin = gridS.getBinVolumes(); w_vbin = w_vbin(:);
+    end
+catch
+end
+if isempty(w_vbin)
+    try
+        w_vbin = Disaggregation.getBinVolumes_cm3(gridS); w_vbin = w_vbin(:);
+    catch
+    end
+end
+if isempty(w_vbin)
+    w_vbin = (4/3)*pi*(r_cm(:).^3);
+end
+
+% auto weight (for coag conservation checks only)
+[w_auto, wname_auto, wdbg] = getConservedWeight_AUTO(cfg, sim, gridS, r_cm, Ns, Nz, dz_cm, t, Y);
 dbg.weight_debug = wdbg;
+
+% ==========================================================
+% IMPORTANT: FORCE biovolume-space diagnostics here
+% (no cfg.diag_budget_space required)
+% ==========================================================
+w_budget = w_vbin;
+wname_budget = "Vbin(budget)";
 
 dbg.is_col = is_col;
 dbg.Nz = Nz;
 dbg.Ns = Ns;
-dbg.weight_name = wname;
-dbg.weight_min = min(w);
-dbg.weight_max = max(w);
+dbg.weight_auto_name = wname_auto;
+dbg.weight_budget_name = wname_budget;
+dbg.weight_budget_min = min(w_budget);
+dbg.weight_budget_max = max(w_budget);
 
-% ----------------------------------------------------------
-% UPDATED: Use OutputGenerator diam_i for bin thresholds (preferred)
-% ----------------------------------------------------------
+% ==========================================================
+% 3.5) DIAMETERS (for thresholds)
+% ==========================================================
 D_um = [];
 try
     if isfield(out,'output_data') && isfield(out.output_data,'diam_i') && ~isempty(out.output_data.diam_i)
-        % diam_i is in cm
-        D_um = out.output_data.diam_i(:) * 1e4;
+        D_um = out.output_data.diam_i(:) * 1e4; % cm -> um
         dbg.D_um_source = 'out.output_data.diam_i';
     end
 catch
 end
-
 if isempty(D_um)
     D_um = 2 * r_cm * 1e4;
     dbg.D_um_source = 'r_cm (fallback)';
 end
-
 dbg.D_um_min = min(D_um);
 dbg.D_um_max = max(D_um);
 
 % ==========================================================
-% 4) EXPORT OPERATOR (fallback only)
+% 4) EXPORT FLUX (prefer OutputGenerator)
 % ==========================================================
 sink_rate_vec = [];
 if isfield(sim.operators,'sink_rate') && ~isempty(sim.operators.sink_rate)
-    sink_rate_vec = sim.operators.sink_rate(:);  % Ns x 1 expected
+    sink_rate_vec = sim.operators.sink_rate(:);
 end
 
-fprintf('DEBUG: is_col=%d Nz=%d | sink_rate_vec=%s | weight=%s\n', ...
-    is_col, Nz, mat2str(size(sink_rate_vec)), wname);
+fprintf('DEBUG: is_col=%d Nz=%d | sink_rate_vec=%s | weight_auto=%s | budget=%s\n', ...
+    is_col, Nz, mat2str(size(sink_rate_vec)), wname_auto, wname_budget);
 dbg.sink_rate_vec_size = size(sink_rate_vec);
 
-% ----------------------------------------------------------
-% UPDATED: Prefer export flux directly from OutputGenerator
-% ----------------------------------------------------------
 Fsect_export = [];
 Fsect_name   = '';
+
 try
     if isfield(out,'output_data') && ~isempty(out.output_data)
         od = out.output_data;
-        if isfield(od,'bottom_fluxsect_weighted') && ~isempty(od.bottom_fluxsect_weighted)
-            Fsect_export = od.bottom_fluxsect_weighted;   % [nt x Ns]
-            Fsect_name = 'bottom_fluxsect_weighted';
+
+        if isfield(od,'bottom_fluxsect_cm3cm2d') && ~isempty(od.bottom_fluxsect_cm3cm2d)
+            Fsect_export = od.bottom_fluxsect_cm3cm2d; % [nt x Ns]
+            Fsect_name   = 'bottom_fluxsect_cm3cm2d';
         elseif isfield(od,'bottom_fluxsect_cm3m2d') && ~isempty(od.bottom_fluxsect_cm3m2d)
-            Fsect_export = od.bottom_fluxsect_cm3m2d;     % [nt x Ns]
-            Fsect_name = 'bottom_fluxsect_cm3m2d';
+            Fsect_export = od.bottom_fluxsect_cm3m2d;  % [nt x Ns]
+            Fsect_name   = 'bottom_fluxsect_cm3m2d';
         end
     end
 catch
@@ -278,9 +274,9 @@ dbg.nA = [numel(idxA_small) numel(idxA_med) numel(idxA_large)];
 dbg.nB = [numel(idxB_small) numel(idxB_med) numel(idxB_large)];
 
 % ==========================================================
-% 6) MASS BALANCE
+% 6) MASS BALANCE (BIOVOLUME SPACE)
 % ==========================================================
-inventory_mode = "integrated"; % "integrated" or "surface"
+inventory_mode = "integrated";
 nt = numel(t);
 
 M   = zeros(nt,1);
@@ -292,11 +288,18 @@ dMdt_disagg = zeros(nt,1);
 dMdt_other  = zeros(nt,1);
 dMdt_pp     = zeros(nt,1);
 
-intTerm = @(dv) integrateMassProxy(dv, w, Ns, Nz, dz_cm, inventory_mode);
+intTerm = @(dv) integrateMassProxy(dv, w_budget, Ns, Nz, dz_cm, inventory_mode);
+
+use_pp = false;
+try
+    use_pp = isprop(cfg,'enable_pp') && cfg.enable_pp;
+catch
+end
 
 for it = 1:nt
     vflat = Y(it,:)';
 
+    % inventory in BV space
     M(it) = intTerm(vflat);
 
     T = sim.rhs.decomposeTerms(t(it), vflat);
@@ -304,27 +307,33 @@ for it = 1:nt
     if isfield(T,'dv_lin')    && ~isempty(T.dv_lin),    dMdt_lin(it)    = intTerm(T.dv_lin);    end
     if isfield(T,'dv_coag')   && ~isempty(T.dv_coag),   dMdt_coag(it)   = intTerm(T.dv_coag);   end
     if isfield(T,'dv_disagg') && ~isempty(T.dv_disagg), dMdt_disagg(it) = intTerm(T.dv_disagg); end
-use_pp = false;
-try
-    use_pp = isprop(cfg,'enable_pp') && cfg.enable_pp;
-catch
-end
+    if isfield(T,'dv_other')  && ~isempty(T.dv_other),  dMdt_other(it)  = intTerm(T.dv_other);  end
 
-if use_pp
-    if isfield(T,'dv_pp') && ~isempty(T.dv_pp)
+    if use_pp && isfield(T,'dv_pp') && ~isempty(T.dv_pp)
         dMdt_pp(it) = intTerm(T.dv_pp);
+    else
+        dMdt_pp(it) = 0;
     end
-else
-    dMdt_pp(it) = 0;  % force off for simple budget + PP plots
-end
-if isfield(T,'dv_other')  && ~isempty(T.dv_other),  dMdt_other(it)  = intTerm(T.dv_other);  end
 
-    % keep OLD EX estimate (used only for simple residual)
-    if is_col && Nz > 1 && ~isempty(sink_rate_vec)
-        N2 = reshape(vflat,[Ns Nz]);
-        vbot = N2(:,end);
-        ex_num = vbot .* max(sink_rate_vec,0);
-        EX(it) = sum(ex_num .* w(:));
+    % export EX in the SAME BV space
+    if ~isempty(Fsect_export)
+        F = max(Fsect_export(it,:), 0);
+
+        if strcmp(Fsect_name, 'bottom_fluxsect_cm3m2d')
+            EX(it) = sum(F) * 1e-4;   % m^2 -> cm^2
+        else
+            EX(it) = sum(F);          % already cm^3/cm^2/day
+        end
+    else
+        % fallback (only if no OutputGenerator flux exists)
+        if is_col && Nz > 1 && ~isempty(sink_rate_vec)
+            N2 = reshape(vflat,[Ns Nz]);
+            vbot = N2(:,end);
+            ex_num = vbot .* max(sink_rate_vec,0);
+            EX(it) = sum(ex_num .* w_budget(:));
+        else
+            EX(it) = 0;
+        end
     end
 end
 
@@ -335,12 +344,12 @@ RES_simple = dMdt_fd - (dMdt_pp - EX);
 RES_full   = dMdt_fd - (dMdt_lin + dMdt_coag + dMdt_disagg + dMdt_other + dMdt_pp);
 
 res_ok  = isfinite(RES_simple) & ((1:nt)' > 1);
-fprintf('Budget residual (simple): median=%.3e max=%.3e\n', ...
-    median(abs(RES_simple(res_ok))), max(abs(RES_simple(res_ok))));
+fprintf('Budget residual (simple, %s): median=%.3e max=%.3e\n', ...
+    wname_budget, median(abs(RES_simple(res_ok))), max(abs(RES_simple(res_ok))));
 
 res_ok2  = isfinite(RES_full) & ((1:nt)' > 1);
-fprintf('Budget residual (FULL terms): median=%.3e max=%.3e\n', ...
-    median(abs(RES_full(res_ok2))), max(abs(RES_full(res_ok2))));
+fprintf('Budget residual (FULL terms, %s): median=%.3e max=%.3e\n', ...
+    wname_budget, median(abs(RES_full(res_ok2))), max(abs(RES_full(res_ok2))));
 
 fprintf('DEBUG: median(|dMdt_disagg|)=%.3e | max(|dMdt_disagg|)=%.3e\n', ...
     median(abs(dMdt_disagg(isfinite(dMdt_disagg)))), max(abs(dMdt_disagg(isfinite(dMdt_disagg)))));
@@ -358,27 +367,26 @@ dbg.RES_full = RES_full;
 fig = figure('Color','w'); turnOffToolbars(fig);
 plot(t,RES_simple,'LineWidth',1.5); grid on;
 xlabel('t [d]'); ylabel('Residual');
-title('Budget residual (simple): dM/dt - (PP - EX)');
+title(sprintf('Budget residual (simple, %s): dM/dt - (PP - EX)', wname_budget));
 safeExportPNG(fig, fullfile(outdir,'mass_balance_residual_simple.png'));
 if ~isempty(fig) && isvalid(fig), close(fig); end
 
 fig = figure('Color','w'); turnOffToolbars(fig);
 plot(t,RES_full,'LineWidth',1.5); grid on;
 xlabel('t [d]'); ylabel('Residual');
-title('Budget residual (FULL): dM/dt - \int(sum terms)');
+title(sprintf('Budget residual (FULL, %s): dM/dt - \\int(sum terms)', wname_budget));
 safeExportPNG(fig, fullfile(outdir,'mass_balance_residual_full.png'));
 if ~isempty(fig) && isvalid(fig), close(fig); end
 
 % ==========================================================
-% 7) EXPORT SIZE FRACTIONS (UPDATED)
+% 7) EXPORT SIZE FRACTIONS (from flux if available)
 % ==========================================================
 if ~isempty(Fsect_export)
     [FsB,FmB,FlB,tot_export] = exportFractions_FromFlux(Fsect_export, idxB_small, idxB_med, idxB_large);
     [FsA,FmA,FlA,~]          = exportFractions_FromFlux(Fsect_export, idxA_small, idxA_med, idxA_large);
 else
-    % OLD (kept): fallback to sink_rate method
-    [FsB,FmB,FlB,tot_export] = exportFractions(Y, Ns, Nz, w, sink_rate_vec, idxB_small, idxB_med, idxB_large);
-    [FsA,FmA,FlA,~]          = exportFractions(Y, Ns, Nz, w, sink_rate_vec, idxA_small, idxA_med, idxA_large);
+    [FsB,FmB,FlB,tot_export] = exportFractions(Y, Ns, Nz, w_auto, sink_rate_vec, idxB_small, idxB_med, idxB_large);
+    [FsA,FmA,FlA,~]          = exportFractions(Y, Ns, Nz, w_auto, sink_rate_vec, idxA_small, idxA_med, idxA_large);
 end
 
 dbg.Fs_500_1000 = FsB; dbg.Fm_500_1000 = FmB; dbg.Fl_500_1000 = FlB;
@@ -408,7 +416,7 @@ safeExportPNG(fig, fullfile(outdir,'export_sizefractions_500_2000.png'));
 if ~isempty(fig) && isvalid(fig), close(fig); end
 
 % ==========================================================
-% 7.5) SIZE SPECTRA: ONE FIGURE, ALL DEPTHS AS SUBPLOTS
+% 7.5) SIZE SPECTRA (ONLY if column)
 % ==========================================================
 do_spectra = true;
 
@@ -418,8 +426,8 @@ if do_spectra && is_col && isfield(out,'output_data') && isfield(out.output_data
     depth_list_m = [10 50 100];
     time_list_d  = [0 5 10 19 20 21 22 23 24 25];
 
-    zc = od.z(:);                 % layer centers [m]
-    Dum = od.diam_i(:) * 1e4;     % um
+    zc  = od.z(:);
+    Dum = od.diam_i(:) * 1e4;
 
     [Dum_sort, isort] = sort(Dum);
 
@@ -436,7 +444,7 @@ if do_spectra && is_col && isfield(out,'output_data') && isfield(out.output_data
             treq = time_list_d(jt);
             [~,itp] = min(abs(t - treq));
 
-            Nlayer = squeeze(od.Y3(itp, kz, :));  % Ns x 1
+            Nlayer = squeeze(od.Y3(itp, kz, :));
             Nplot  = max(Nlayer(:), 0);
             Nplot  = Nplot(isort);
 
@@ -444,27 +452,25 @@ if do_spectra && is_col && isfield(out,'output_data') && isfield(out.output_data
         end
 
         grid on;
-        xlabel('D [\mum]');
-        ylabel('N');
+        xlabel('D [\mum]'); ylabel('N');
         title(sprintf('z=%.1f m', zpick));
         set(gca,'XLim',[max(1,min(Dum_sort)) max(Dum_sort)]);
     end
 
     title(tl, 'Size spectra (lines = selected times)');
-    lg = legend(string(time_list_d), 'Location','eastoutside'); %#ok<NASGU>
-
+    legend(string(time_list_d), 'Location','eastoutside');
     safeExportPNG(fig, fullfile(figdir_spectra, 'sizespectra_all_depths.png'));
     if ~isempty(fig) && isvalid(fig), close(fig); end
 end
 
 % ==========================================================
-% 7.6) TENDENCIES vs SIZE: ONE FIGURE PER TERM, DEPTHS AS SUBPLOTS
+% 7.6) TENDENCIES vs SIZE (ONLY if column)
 % ==========================================================
 do_tendencies = true;
 
 if do_tendencies && is_col
     depth_list_m = [10 50 100];
-    time_list_d  = [19 20 21 22 23 24 25];   % turbulence window
+    time_list_d  = [19 20 21 22 23 24 25];
 
     Dum = D_um(:);
     [Dum_sort, isort] = sort(Dum);
@@ -498,9 +504,9 @@ if do_tendencies && is_col
                     continue;
                 end
 
-                dv = T.(field);
-                dv2 = reshape(dv, [Ns Nz]);     % Ns x Nz
-                dvk = dv2(:, kz);               % Ns x 1
+                dv  = T.(field);
+                dv2 = reshape(dv, [Ns Nz]);
+                dvk = dv2(:, kz);
 
                 y = dvk(:);
                 y = y(isort);
@@ -509,13 +515,12 @@ if do_tendencies && is_col
 
             grid on;
             set(gca,'XScale','log');
-            xlabel('D [\mum]');
-            ylabel('tendency');
+            xlabel('D [\mum]'); ylabel('tendency');
             title(sprintf('z=%.1f m', zpick));
         end
 
         title(tl, sprintf('dQ/dt vs size | term=%s (lines = times)', pretty{tn}));
-        lg = legend(string(time_list_d), 'Location','eastoutside'); %#ok<NASGU>
+        legend(string(time_list_d), 'Location','eastoutside');
 
         fname = sprintf('dQdt_%s_all_depths.png', pretty{tn});
         safeExportPNG(fig, fullfile(figdir_tend, fname));
@@ -546,7 +551,6 @@ dbg = struct();
 
 wOnes = ones(Ns,1);
 
-% Vbin
 wVbin = [];
 try
     if ismethod(gridS,'getBinVolumes')
@@ -566,7 +570,6 @@ if isempty(wVbin)
     wVbin = (4/3)*pi*(r_cm(:).^3);
 end
 
-% av_vol (optional)
 wAv = [];
 try
     if isprop(sim.grid,'av_vol') && ~isempty(sim.grid.av_vol)
@@ -638,8 +641,7 @@ Fs = nan(nt,1); Fm = nan(nt,1); Fl = nan(nt,1);
 tot_export = nan(nt,1);
 
 for it = 1:nt
-    F = Fsect(it,:);
-    F = max(F,0);
+    F = max(Fsect(it,:),0);
     tot = sum(F);
     tot_export(it) = tot;
 
@@ -715,12 +717,7 @@ try, set(fig,'Toolbar','none'); end %#ok<TRYNC>
 try, set(fig,'Menubar','none'); end %#ok<TRYNC>
 end
 
-% ===========================
-% ONLY CHANGE #1: robust export
-% ===========================
 function safeExportPNG(fig, filename)
-% Robust PNG export that avoids exportgraphics crashes on some MATLAB builds.
-
 if isempty(fig) || ~isvalid(fig)
     fprintf('WARNING: figure invalid before export: %s\n', filename);
     return;
@@ -729,12 +726,10 @@ end
 try
     drawnow;
 
-    % Try exportgraphics first
     try
         exportgraphics(fig, filename, 'Resolution', 200);
         return;
     catch
-        % fall back to print
     end
 
     set(fig,'PaperPositionMode','auto');
